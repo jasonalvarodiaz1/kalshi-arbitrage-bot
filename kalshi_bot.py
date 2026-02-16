@@ -1116,10 +1116,12 @@ class KalshiTradingBot:
             yes_order = self.api.place_order(ticker, 'yes', quantity, yes_price, order_type='limit')
 
             if not yes_order:
-                logger.error("❌ YES order failed for %s. No orders placed.", ticker)
+                logger.error("YES order failed for %s. No orders placed.", ticker)
                 return False
 
             yes_order_id = yes_order.get('order', {}).get('order_id') or yes_order.get('order_id')
+            if not yes_order_id:
+                logger.warning("YES order succeeded but order_id not found in response. Cannot cancel if NO order fails.")
 
             # Place NO order
             logger.info("Placing NO order: %s qty=%d price=%d¢", ticker, quantity, no_price)
@@ -1127,11 +1129,11 @@ class KalshiTradingBot:
 
             if not no_order:
                 # CRITICAL: YES succeeded but NO failed — cancel YES to prevent naked exposure
-                logger.critical("❌ NO order failed for %s! Cancelling YES order %s to prevent naked exposure...", ticker, yes_order_id)
+                logger.critical("NO order failed for %s! Cancelling YES order %s to prevent naked exposure...", ticker, yes_order_id)
                 if yes_order_id and self.api.cancel_order(yes_order_id):
-                    logger.info("✅ YES order %s cancelled successfully. No exposure.", yes_order_id)
+                    logger.info("YES order %s cancelled successfully. No exposure.", yes_order_id)
                 else:
-                    logger.critical("⚠️ FAILED to cancel YES order %s! MANUAL INTERVENTION REQUIRED. Check positions immediately.", yes_order_id)
+                    logger.critical("FAILED to cancel YES order %s! MANUAL INTERVENTION REQUIRED. Check positions immediately.", yes_order_id)
                 return False
 
             logger.info("✅ Both orders placed successfully for %s", ticker)
