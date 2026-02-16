@@ -145,7 +145,14 @@ class Storage:
             trade_type = trade.get('type', 'arbitrage')
             side = trade.get('side')
             quantity = trade.get('quantity')
-            price = trade.get('yes_price') or trade.get('no_price') or trade.get('price')
+            # Extract price from trade dict, handling multiple field names
+            # Check explicitly for None to avoid issues with 0 cent prices
+            if trade.get('yes_price') is not None:
+                price = trade.get('yes_price')
+            elif trade.get('no_price') is not None:
+                price = trade.get('no_price')
+            else:
+                price = trade.get('price')
             cost = trade.get('cost')
             expected_profit = trade.get('expected_profit')
             realized_profit = trade.get('realized_profit')

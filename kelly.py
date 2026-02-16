@@ -49,7 +49,7 @@ def size_position(bankroll: float, win_prob: float, contract_price_cents: int,
         kelly_multiplier: Fraction of Kelly to use (0.5 = half-Kelly, conservative)
     
     Returns: 
-        Number of contracts (integer, minimum 1 if positive edge)
+        Number of contracts (integer, 0 if no positive edge)
     """
     if bankroll <= 0 or contract_price_cents <= 0 or win_prob <= 0:
         return 0
@@ -69,7 +69,7 @@ def size_position(bankroll: float, win_prob: float, contract_price_cents: int,
     kelly = kelly_fraction(win_prob, win_amount, loss_amount)
     
     if kelly <= 0:
-        return 0
+        return 0  # Kelly says don't bet
     
     # Apply conservative multiplier (half-Kelly recommended)
     fraction_to_bet = kelly * kelly_multiplier
@@ -83,8 +83,5 @@ def size_position(bankroll: float, win_prob: float, contract_price_cents: int,
     # Convert to number of contracts
     num_contracts = int(bet_size_usd / contract_price_usd)
     
-    # Ensure at least 1 contract if we have positive edge and can afford it
-    if num_contracts == 0 and bankroll >= contract_price_usd and kelly > 0:
-        num_contracts = 1
-    
+    # Return calculated quantity (may be 0 if Kelly sizing is too conservative)
     return num_contracts

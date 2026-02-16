@@ -203,7 +203,9 @@ class TestProbabilityEstimation(unittest.TestCase):
             current_price, strike, minutes_remaining, asset, 'above'
         )
         
-        # Should return 0.5 (no information)
+        # With zero time remaining, the function returns 0.5 as it has 
+        # no valid information to calculate a probability (edge case handling)
+        # In reality, with 0 time the market should be settled already
         self.assertEqual(prob, 0.5)
 
 

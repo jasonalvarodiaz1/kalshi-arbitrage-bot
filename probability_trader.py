@@ -2,6 +2,7 @@
 
 import re
 import time
+import math
 import logging
 import requests
 from typing import Dict, List, Optional
@@ -12,7 +13,6 @@ try:
     SCIPY_AVAILABLE = True
 except ImportError:
     SCIPY_AVAILABLE = False
-    import math
 
 from config import Config
 from kelly import kelly_fraction, size_position
@@ -190,11 +190,11 @@ class ProbabilityTrader:
         time_in_years = minutes_remaining / (365.25 * 24 * 60)
         
         # For very short timeframes, use the base 15-min vol
-        # Scale vol by sqrt(time) for longer periods
+        # Scale vol by sqrt(time) for longer periods (standard volatility scaling)
+        # Note: We scale from 15-min base, so vol_scaled = vol * sqrt(minutes_remaining / 15)
         vol_scaled = vol * (minutes_remaining / 15.0) ** 0.5 if minutes_remaining > 15 else vol
         
         # Calculate z-score
-        import math
         if current_price == strike:
             z = 0
         else:
@@ -267,8 +267,13 @@ class ProbabilityTrader:
         if not yes_asks or not no_asks:
             return None
         
-        best_yes_price = min([ask[0] for ask in yes_asks])
-        best_no_price = min([ask[0] for ask in no_asks])
+        # Extract best prices (validate orderbook format)
+        try:
+            best_yes_price = min([ask[0] for ask in yes_asks])
+            best_no_price = min([ask[0] for ask in no_asks])
+        except (IndexError, TypeError):
+            logger.warning("Invalid orderbook format for %s", ticker)
+            return None
         
         # Estimate actual probability
         # For "above" markets, YES pays if price > strike

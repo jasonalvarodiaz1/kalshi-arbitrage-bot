@@ -11,6 +11,7 @@ from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from cryptography.hazmat.backends import default_backend
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from notifications import NotificationManager
+from kelly import size_position
 
 
 # Configure logging
@@ -890,7 +891,6 @@ class KalshiTradingBot:
         
         # Calculate quantity using Kelly if requested and not provided
         if quantity is None and use_kelly:
-            from kelly import size_position
             # For arbitrage, win probability is effectively 1.0 (guaranteed profit)
             win_prob = 0.99  # Nearly certain
             avg_price = (yes_price + no_price) / 2
