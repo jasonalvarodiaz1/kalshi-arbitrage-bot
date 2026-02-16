@@ -576,6 +576,83 @@ class KalshiArbitrageBot:
             return False
         return True
 
+    def _is_crypto_market(self, market: Dict) -> bool:
+        """Check if market is a short-duration crypto interval market."""
+        ticker = market.get('ticker', '')
+        series = market.get('series_ticker', '')
+        return any(prefix in (ticker, series) for prefix in ('KXBTC', 'KXETH', 'KXSOL', 'KXDOGE'))
+
+    def _get_market_thresholds(self, market: Dict) -> Dict:
+        """Return adaptive filter thresholds based on market type.
+        
+        Crypto 15-min markets need relaxed volume/price floors because they
+        launch fresh every 15 minutes with 0 volume. The orderbook depth
+        check (MIN_QTY_AT_BEST) downstream still protects against empty books.
+        """
+        if self._is_crypto_market(market):
+            # Check duration — only relax for short-duration markets
+            close_time_str = market.get('close_time') or market.get('expiration_time')
+            if close_time_str:
+                try:
+                    close_time = datetime.fromisoformat(close_time_str.replace('Z', '+00:00'))
+                    minutes_remaining = (close_time - datetime.now(timezone.utc)).total_seconds() / 60
+                    if minutes_remaining <= 60:  # Short-duration crypto
+                        return {
+                            'min_volume': 0,
+                            'min_price_cents': 1,  # Allow 1¢ orders on crypto
+                            'min_qty_at_best': 1,   # Less depth required
+                        }
+                except (ValueError, TypeError):
+                    pass
+        
+        # Default thresholds for non-crypto / longer-duration markets
+        return {
+            'min_volume': self.MIN_VOLUME,        # 10
+            'min_price_cents': self.MIN_PRICE_CENTS,  # 3
+            'min_qty_at_best': self.MIN_QTY_AT_BEST,  # 2
+        }
+
+    def _walk_orderbook(self, asks: List[List], target_qty: int) -> Optional[Dict]:
+        """Walk an orderbook to find the volume-weighted average fill price for target_qty.
+        
+        Args:
+            asks: List of [price, quantity] pairs, sorted by price ascending
+            target_qty: Number of contracts to fill
+        
+        Returns:
+            Dict with 'avg_price', 'total_cost', 'filled_qty', 'levels_used',
+            or None if not enough depth.
+        """
+        if not asks:
+            return None
+        
+        # Sort asks by price ascending (best first)
+        sorted_asks = sorted(asks, key=lambda a: a[0])
+        
+        filled = 0
+        total_cost = 0
+        levels_used = 0
+        
+        for price, qty in sorted_asks:
+            can_fill = min(qty, target_qty - filled)
+            total_cost += price * can_fill
+            filled += can_fill
+            levels_used += 1
+            
+            if filled >= target_qty:
+                break
+        
+        if filled == 0:
+            return None
+        
+        return {
+            'avg_price': total_cost / filled,
+            'total_cost': total_cost,
+            'filled_qty': filled,
+            'levels_used': levels_used,
+            'fully_filled': filled >= target_qty,
+        }
+
     def _max_executable_qty(self, orderbook: Dict, side: str = 'both') -> int:
         """Calculate maximum executable quantity from orderbook depth.
         
@@ -612,6 +689,8 @@ class KalshiArbitrageBot:
         Applies strict filters to avoid illiquid traps.
         """
         try:
+            thresholds = self._get_market_thresholds(market)
+            
             yes_asks = orderbook.get('yes_asks', [])
             no_asks = orderbook.get('no_asks', [])
             
@@ -621,8 +700,8 @@ class KalshiArbitrageBot:
             best_yes_ask = min([ask[0] for ask in yes_asks])
             best_no_ask = min([ask[0] for ask in no_asks])
 
-            # Filter: ignore penny orders (likely stale/trap)
-            if best_yes_ask < self.MIN_PRICE_CENTS or best_no_ask < self.MIN_PRICE_CENTS:
+            # Filter: ignore penny orders (adaptive threshold)
+            if best_yes_ask < thresholds['min_price_cents'] or best_no_ask < thresholds['min_price_cents']:
                 return None
             
             total_cost = best_yes_ask + best_no_ask
@@ -634,8 +713,6 @@ class KalshiArbitrageBot:
             profit_percent = (profit / total_cost) * 100
             
             # Must be profitable but also realistic (not a 4900% illiquid trap)
-            if profit_percent <= self.min_profit_percent:
-                return None
             if profit_percent > self.MAX_PROFIT_PERCENT:
                 return None  # Too good to be true — illiquid market
 
@@ -644,22 +721,53 @@ class KalshiArbitrageBot:
 
             max_qty = self._max_executable_qty(orderbook)
 
-            # Must have enough depth to actually execute
-            if max_qty < self.MIN_QTY_AT_BEST:
+            # Must have enough depth to actually execute (adaptive threshold)
+            if max_qty < thresholds['min_qty_at_best']:
                 return None
             
-            return {
-                'ticker': market.get('ticker'),
-                'title': market.get('title'),
-                'yes_price': best_yes_ask,
-                'no_price': best_no_ask,
-                'total_cost': total_cost,
-                'profit_cents': profit,
-                'profit_percent': profit_percent,
-                'max_executable_qty': max_qty,
-                'strategy': 'Buy both YES and NO, guaranteed profit on settlement',
-                'timestamp': datetime.now().isoformat()
-            }
+            # If profitable at top of book, return immediately
+            if profit_percent > self.min_profit_percent:
+                return {
+                    'ticker': market.get('ticker'),
+                    'title': market.get('title'),
+                    'yes_price': best_yes_ask,
+                    'no_price': best_no_ask,
+                    'total_cost': total_cost,
+                    'profit_cents': profit,
+                    'profit_percent': profit_percent,
+                    'max_executable_qty': max_qty,
+                    'strategy': 'Buy both YES and NO, guaranteed profit on settlement',
+                    'timestamp': datetime.now().isoformat()
+                }
+            
+            # --- Depth-based arb check ---
+            # If top-of-book isn't profitable, check if walking the book reveals arb
+            if total_cost >= 100 and total_cost <= 105:
+                walk_qty = max(Config.MIN_ORDER_QUANTITY, thresholds.get('min_qty_at_best', 2))
+                yes_walk = self._walk_orderbook(yes_asks, walk_qty)
+                no_walk = self._walk_orderbook(no_asks, walk_qty)
+                
+                if yes_walk and no_walk and yes_walk['fully_filled'] and no_walk['fully_filled']:
+                    walked_total = yes_walk['avg_price'] + no_walk['avg_price']
+                    walked_profit = 100 - walked_total
+                    if walked_total > 0 and walked_profit > 0:
+                        walked_profit_pct = (walked_profit / walked_total) * 100
+                        if walked_profit_pct > self.min_profit_percent and walked_profit_pct <= self.MAX_PROFIT_PERCENT:
+                            return {
+                                'ticker': market.get('ticker'),
+                                'title': market.get('title'),
+                                'yes_price': round(yes_walk['avg_price'], 2),
+                                'no_price': round(no_walk['avg_price'], 2),
+                                'total_cost': round(walked_total, 2),
+                                'profit_cents': round(walked_profit, 2),
+                                'profit_percent': walked_profit_pct,
+                                'max_executable_qty': min(yes_walk['filled_qty'], no_walk['filled_qty']),
+                                'strategy': f'Depth arb: VWAP YES={yes_walk["avg_price"]:.1f}¢ + NO={no_walk["avg_price"]:.1f}¢ across {yes_walk["levels_used"]+no_walk["levels_used"]} levels',
+                                'timestamp': datetime.now().isoformat(),
+                                'depth_based': True,
+                            }
+            
+            return None
             
         except Exception as e:
             print(f"Error analyzing market: {e}")
@@ -681,6 +789,8 @@ class KalshiArbitrageBot:
             min_qty = float('inf')
 
             for market in event_markets:
+                thresholds = self._get_market_thresholds(market)
+                
                 ticker = market.get('ticker')
                 orderbook = self.api.get_orderbook(ticker)
                 if not orderbook:
@@ -692,13 +802,13 @@ class KalshiArbitrageBot:
 
                 best_ask = min([a[0] for a in yes_asks])
 
-                # Filter: ignore penny orders
-                if best_ask < self.MIN_PRICE_CENTS:
+                # Filter: ignore penny orders (adaptive threshold)
+                if best_ask < thresholds['min_price_cents']:
                     return None
 
                 # Volume available at best ask
                 best_ask_qty = next((a[1] for a in yes_asks if a[0] == best_ask), 1)
-                if best_ask_qty < self.MIN_QTY_AT_BEST:
+                if best_ask_qty < thresholds['min_qty_at_best']:
                     return None
 
                 min_qty = min(min_qty, best_ask_qty)
@@ -805,8 +915,8 @@ class KalshiArbitrageBot:
         The /markets response includes yes_ask, no_ask, volume, liquidity fields.
         We only deep-scan markets that:
          1. Settle within our time window (MAX_EXPIRY_HOURS)
-         2. Have both yes_ask and no_ask above MIN_PRICE_CENTS
-         3. Have meaningful volume or open interest
+         2. Have both yes_ask and no_ask above MIN_PRICE_CENTS (adaptive for crypto)
+         3. Have meaningful volume or open interest (adaptive for crypto)
          4. Quick-check: yes_ask + no_ask < 100 (potential arb)
         """
         candidates = []
@@ -827,17 +937,19 @@ class KalshiArbitrageBot:
             except (ValueError, TypeError):
                 continue
 
+            thresholds = self._get_market_thresholds(m)
+            
             yes_ask = m.get('yes_ask') or 0
             no_ask = m.get('no_ask') or 0
             volume = m.get('volume') or 0
             open_interest = m.get('open_interest') or 0
 
-            # Must have both sides quoted above minimum price
-            if yes_ask < self.MIN_PRICE_CENTS or no_ask < self.MIN_PRICE_CENTS:
+            # Must have both sides quoted above minimum price (adaptive)
+            if yes_ask < thresholds['min_price_cents'] or no_ask < thresholds['min_price_cents']:
                 continue
 
-            # Must have real trading activity
-            if volume < self.MIN_VOLUME and open_interest < self.MIN_VOLUME:
+            # Must have real trading activity (adaptive — relaxed for crypto)
+            if volume < thresholds['min_volume'] and open_interest < thresholds['min_volume']:
                 continue
 
             # Quick arb pre-screen: total cost must be below payout
