@@ -22,6 +22,21 @@ class Config:
     LIVE_TRADING_ENABLED = os.getenv('ENABLE_LIVE_TRADING', 'false').lower() == 'true'
     MAX_TRADE_USD = float(os.getenv('MAX_TRADE_USD', 100.0))
     
+    # Notification Configuration
+    SMTP_HOST = os.getenv('SMTP_HOST')
+    SMTP_PORT = int(os.getenv('SMTP_PORT', 587))
+    SMTP_USER = os.getenv('SMTP_USER')
+    SMTP_PASSWORD = os.getenv('SMTP_PASSWORD')
+    NOTIFICATION_EMAIL = os.getenv('NOTIFICATION_EMAIL')
+    WEBHOOK_URL = os.getenv('WEBHOOK_URL')
+    
+    # Filtering
+    MIN_EXPIRY_MINUTES = int(os.getenv('MIN_EXPIRY_MINUTES', 30))
+    
+    # Position Limits
+    MAX_POSITIONS = int(os.getenv('MAX_POSITIONS', 10))
+    MAX_EXPOSURE_USD = float(os.getenv('MAX_EXPOSURE_USD', 500.0))
+    
     # API Settings
     BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
     RATE_LIMIT_DELAY = 0.3  # Seconds between requests

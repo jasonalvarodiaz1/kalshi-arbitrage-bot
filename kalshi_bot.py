@@ -1,13 +1,15 @@
 import requests
 import time
 from typing import Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from config import Config
 from urllib.parse import urlparse
 import base64
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from cryptography.hazmat.backends import default_backend
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from notifications import NotificationManager
 
 class KalshiAPI:
     """Wrapper for Kalshi Exchange API"""
@@ -21,6 +23,7 @@ class KalshiAPI:
         self.password = password
         self.api_key = api_key  # This is the KEY ID (UUID), not a bearer token
         self.token = None
+        self.token_expires_at = None
         self.private_key = None  # Loaded RSA key object
         self.salt_length = asym_padding.PSS.DIGEST_LENGTH  # Will try MAX_LENGTH as fallback
         self.BASE_URL = self.PROD_BASE_URL
@@ -130,6 +133,8 @@ class KalshiAPI:
             if response.status_code == 200:
                 data = response.json()
                 self.token = data.get('token')
+                # Kalshi tokens typically expire in ~24 hours; refresh proactively at 23 hours
+                self.token_expires_at = time.time() + (23 * 3600)
                 self.session.headers.update({
                     'Authorization': f'Bearer {self.token}'
                 })
@@ -142,8 +147,16 @@ class KalshiAPI:
             print(f"❌ Login error: {e}")
             return False
     
+    def _ensure_auth(self):
+        """Check if auth token needs refresh and re-login if needed."""
+        if self.token and self.token_expires_at:
+            if time.time() > self.token_expires_at:
+                print("🔄 Token expiring soon, refreshing...")
+                self.login()
+    
     def get_markets(self, status: str = "open", limit: int = 100) -> List[Dict]:
         """Fetch active markets"""
+        self._ensure_auth()
         try:
             endpoint = f"{self.BASE_URL}/markets"
             params = {
@@ -171,6 +184,7 @@ class KalshiAPI:
     
     def get_market(self, ticker: str) -> Optional[Dict]:
         """Get specific market by ticker"""
+        self._ensure_auth()
         try:
             endpoint = f"{self.BASE_URL}/markets/{ticker}"
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
@@ -187,6 +201,7 @@ class KalshiAPI:
     
     def get_orderbook(self, ticker: str) -> Dict:
         """Get orderbook for a market"""
+        self._ensure_auth()
         try:
             endpoint = f"{self.BASE_URL}/markets/{ticker}/orderbook"
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
@@ -210,6 +225,7 @@ class KalshiAPI:
     
     def get_trades(self, ticker: str, limit: int = 100) -> List[Dict]:
         """Get recent trades for a market"""
+        self._ensure_auth()
         try:
             endpoint = f"{self.BASE_URL}/markets/{ticker}/trades"
             params = {'limit': limit}
@@ -229,6 +245,7 @@ class KalshiAPI:
     
     def get_balance(self) -> float:
         """Get account balance (requires authentication)"""
+        self._ensure_auth()
         try:
             endpoint = f"{self.BASE_URL}/portfolio/balance"
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
@@ -256,6 +273,7 @@ class KalshiAPI:
             price: Price in cents (e.g., 50 = $0.50)
             order_type: "limit" or "market"
         """
+        self._ensure_auth()
         try:
             endpoint = f"{self.BASE_URL}/portfolio/orders"
             payload = {
@@ -283,6 +301,59 @@ class KalshiAPI:
         except Exception as e:
             print(f"Error placing order: {e}")
             return None
+    
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel an order"""
+        self._ensure_auth()
+        try:
+            endpoint = f"{self.BASE_URL}/portfolio/orders/{order_id}"
+            path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
+            path = f"{path_prefix}/portfolio/orders/{order_id}"
+            headers = self._signed_headers('DELETE', path)
+            response = self.session.delete(endpoint, headers=headers if headers else None)
+            
+            if response.status_code == 200:
+                return True
+            else:
+                print(f"Cancel order failed: {response.status_code} - {response.text}")
+                return False
+        except Exception as e:
+            print(f"Error cancelling order: {e}")
+            return False
+    
+    def get_order(self, order_id: str) -> Optional[Dict]:
+        """Get order details"""
+        self._ensure_auth()
+        try:
+            endpoint = f"{self.BASE_URL}/portfolio/orders/{order_id}"
+            path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
+            path = f"{path_prefix}/portfolio/orders/{order_id}"
+            headers = self._signed_headers('GET', path)
+            response = self.session.get(endpoint, headers=headers if headers else None)
+            
+            if response.status_code == 200:
+                return response.json().get('order')
+            return None
+        except Exception as e:
+            print(f"Error fetching order: {e}")
+            return None
+    
+    def get_positions(self) -> List[Dict]:
+        """Get current positions"""
+        self._ensure_auth()
+        try:
+            endpoint = f"{self.BASE_URL}/portfolio/positions"
+            path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
+            path = f"{path_prefix}/portfolio/positions"
+            headers = self._signed_headers('GET', path)
+            response = self.session.get(endpoint, headers=headers if headers else None)
+            
+            if response.status_code == 200:
+                return response.json().get('positions', [])
+            return []
+        except Exception as e:
+            print(f"Error fetching positions: {e}")
+            return []
 
 
 class KalshiArbitrageBot:
@@ -292,6 +363,7 @@ class KalshiArbitrageBot:
         self.api = api
         self.min_profit_percent = min_profit_percent
         self.opportunities_found = []
+        self.notifier = NotificationManager()
     
     def analyze_market_mispricing(self, market: Dict, orderbook: Dict) -> Optional[Dict]:
         """
@@ -315,6 +387,19 @@ class KalshiArbitrageBot:
             profit_percent = (profit / total_cost) * 100
             
             if profit_percent > self.min_profit_percent:
+                # Add expiry check
+                close_time_str = market.get('close_time') or market.get('expiration_time')
+                if close_time_str:
+                    try:
+                        # Kalshi returns ISO 8601 timestamps
+                        close_time = datetime.fromisoformat(close_time_str.replace('Z', '+00:00'))
+                        now = datetime.now(timezone.utc)
+                        minutes_remaining = (close_time - now).total_seconds() / 60
+                        if minutes_remaining < Config.MIN_EXPIRY_MINUTES:
+                            return None  # Too close to expiry, skip
+                    except (ValueError, TypeError):
+                        pass  # If parsing fails, don't filter
+                
                 return {
                     'ticker': market.get('ticker'),
                     'title': market.get('title'),
@@ -365,6 +450,7 @@ class KalshiArbitrageBot:
                     opportunities.append(opportunity)
                     print(f"  ✅ OPPORTUNITY FOUND!")
                     print(f"     Profit: {opportunity['profit_cents']} cents ({opportunity['profit_percent']:.2f}%)")
+                    self.notifier.notify_opportunity(opportunity)
                 
                 time.sleep(0.3)
                 
@@ -372,6 +458,51 @@ class KalshiArbitrageBot:
                 print(f"  Error scanning {ticker}: {e}")
                 continue
         
+        return opportunities
+    
+    def scan_all_markets_concurrent(self, category_filter: Optional[str] = None, max_workers: int = 5) -> List[Dict]:
+        """Scan all markets using concurrent threads for speed."""
+        print(f"🔍 Scanning Kalshi markets (concurrent, {max_workers} workers)...")
+
+        markets = self.api.get_markets(status="open")
+        print(f"Found {len(markets)} open markets")
+
+        if category_filter:
+            markets = [m for m in markets if category_filter.upper() in m.get('title', '').upper()]
+            print(f"Filtered to {len(markets)} markets matching '{category_filter}'")
+
+        opportunities = []
+
+        def _scan_one(market):
+            ticker = market.get('ticker')
+            try:
+                orderbook = self.api.get_orderbook(ticker)
+                if not orderbook:
+                    return None
+                return self.analyze_market_mispricing(market, orderbook)
+            except Exception as e:
+                print(f"Error scanning {ticker}: {e}")
+                return None
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_scan_one, m): m for m in markets}
+            scanned = 0
+            for future in as_completed(futures):
+                scanned += 1
+                market = futures[future]
+                ticker = market.get('ticker')
+                title = market.get('title', '')
+                if scanned % 50 == 0 or scanned == len(markets):
+                    print(f"Progress: {scanned}/{len(markets)} markets scanned...")
+                try:
+                    result = future.result()
+                    if result:
+                        opportunities.append(result)
+                        print(f"  ✅ OPPORTUNITY: {ticker} — {result['profit_cents']}¢ ({result['profit_percent']:.2f}%)")
+                        self.notifier.notify_opportunity(result)
+                except Exception as e:
+                    print(f"  Error processing {ticker}: {e}")
+
         return opportunities
     
     def monitor_specific_markets(self, tickers: List[str], interval: int = 60):
@@ -407,6 +538,7 @@ class KalshiArbitrageBot:
                             print(f"Strategy: {opportunity['strategy']}")
                              
                             self.opportunities_found.append(opportunity)
+                            self.notifier.notify_opportunity(opportunity)
                         else:
                             print(f"✓ {ticker}: No opportunity (spread too small)")
                         
@@ -437,6 +569,7 @@ class KalshiTradingBot:
         self.initial_balance = initial_balance
         self.positions = []
         self.trade_history = []
+        self.notifier = NotificationManager()
     
     def execute_arbitrage(self, opportunity: Dict, quantity: int = 1):
         """Execute arbitrage trade (buy both YES and NO)""" 
@@ -481,11 +614,28 @@ class KalshiTradingBot:
 
             print(f"✅ Paper trade recorded")
             print(f"Remaining balance: ${self.balance:.2f}")
+            self.notifier.notify_trade_executed(trade)
 
         else:
             # Live trading path with safeguards
             if not Config.LIVE_TRADING_ENABLED:
                 print("\n⚠️  LIVE TRADING DISABLED - enable by setting ENABLE_LIVE_TRADING=true in .env")
+                return False
+            
+            # Verify live balance before trading
+            live_balance = self.api.get_balance()
+            if live_balance < total_cost:
+                print(f"❌ Insufficient live balance (need ${total_cost:.2f}, have ${live_balance:.2f} on exchange)")
+                return False
+            
+            # Check position limits
+            if len(self.positions) >= Config.MAX_POSITIONS:
+                print(f"⚠️ Position limit reached ({Config.MAX_POSITIONS} positions). Refusing new trade.")
+                return False
+
+            total_exposure = sum(t.get('cost', 0) for t in self.positions)
+            if total_exposure + total_cost > Config.MAX_EXPOSURE_USD:
+                print(f"⚠️ Exposure limit would be exceeded (current: ${total_exposure:.2f}, new: ${total_cost:.2f}, max: ${Config.MAX_EXPOSURE_USD:.2f})")
                 return False
 
             if total_cost > Config.MAX_TRADE_USD:
@@ -528,6 +678,7 @@ class KalshiTradingBot:
                 self.balance -= total_cost
                 self.positions.append(trade)
                 print(f"Remaining balance: ${self.balance:.2f}")
+                self.notifier.notify_trade_executed(trade)
             else:
                 print("❌ One or both orders failed. Check API responses and the exchange UI to reconcile." )
 
@@ -536,6 +687,7 @@ class KalshiTradingBot:
     def get_stats(self) -> Dict:
         """Get trading statistics"""
         total_expected_profit = sum([t.get('expected_profit', 0) for t in self.positions])
+        realized_profit = sum(t.get('realized_profit', 0) for t in self.trade_history if t.get('realized_profit') is not None)
         
         return {
             'paper_trading': self.paper_trading,
@@ -545,7 +697,8 @@ class KalshiTradingBot:
             'open_positions': len(self.positions),
             'total_invested': self.initial_balance - self.balance,
             'expected_profit': total_expected_profit,
-            'expected_roi_percent': (total_expected_profit / (self.initial_balance - self.balance) * 100) if self.balance != self.initial_balance else 0
+            'expected_roi_percent': (total_expected_profit / (self.initial_balance - self.balance) * 100) if self.balance != self.initial_balance else 0,
+            'realized_profit': realized_profit
         }
     
     def print_stats(self):
@@ -563,7 +716,67 @@ class KalshiTradingBot:
         print(f"Open positions: {stats['open_positions']}")
         print(f"Expected profit: ${stats['expected_profit']:.2f}")
         print(f"Expected ROI: {stats['expected_roi_percent']:.2f}%")
+        print(f"Realized profit: ${stats['realized_profit']:.2f}")
         print(f"{'='*60}")
+    
+    def reconcile_positions(self):
+        """Check settled positions and calculate realized P&L."""
+        if not self.positions:
+            print("No open positions to reconcile")
+            return
+
+        settled = []
+        for position in self.positions:
+            ticker = position['ticker']
+            market = self.api.get_market(ticker)
+            if market and market.get('status') in ('settled', 'closed'):
+                result = market.get('result', '')
+                # Each arb position bought both YES and NO, so one of them pays $1
+                payout = position['quantity']  # $1 per contract pair
+                profit = payout - position['cost']
+                position['realized_profit'] = profit
+                position['settlement_result'] = result
+                position['settled_at'] = datetime.now().isoformat()
+                settled.append(position)
+                print(f"  💰 {ticker}: Settled ({result}) — P&L: ${profit:.2f}")
+
+        for s in settled:
+            self.positions.remove(s)
+            self.balance += s['quantity']  # Add payout back
+            self.trade_history.append({**s, 'status': 'settled'})
+
+        if settled:
+            print(f"\nSettled {len(settled)} positions")
+            total_realized = sum(s.get('realized_profit', 0) for s in settled)
+            print(f"Total realized P&L: ${total_realized:.2f}")
+        else:
+            print("No positions have settled yet")
+    
+    def reconcile_with_exchange(self):
+        """Compare local positions with exchange positions for consistency."""
+        print("🔄 Reconciling with exchange...")
+
+        exchange_positions = self.api.get_positions()
+        local_tickers = set(p['ticker'] for p in self.positions)
+        exchange_tickers = set(p.get('ticker') for p in exchange_positions)
+
+        # Find discrepancies
+        missing_on_exchange = local_tickers - exchange_tickers
+        extra_on_exchange = exchange_tickers - local_tickers
+
+        if missing_on_exchange:
+            print(f"⚠️ Positions tracked locally but not on exchange: {missing_on_exchange}")
+        if extra_on_exchange:
+            print(f"⚠️ Positions on exchange but not tracked locally: {extra_on_exchange}")
+        if not missing_on_exchange and not extra_on_exchange:
+            print("✅ Local and exchange positions match")
+
+        return {
+            'local_count': len(local_tickers),
+            'exchange_count': len(exchange_tickers),
+            'missing_on_exchange': list(missing_on_exchange),
+            'extra_on_exchange': list(extra_on_exchange)
+        }
 
 
 def main():
@@ -585,20 +798,23 @@ def main():
     bot = KalshiArbitrageBot(api, min_profit_percent=Config.MIN_PROFIT_PERCENT)
     
     print("Choose mode:")
-    print("1. Scan all markets once")
+    print("1. Scan all markets once (concurrent)")
     print("2. Scan specific category (e.g., BTC, NASDAQ)")
     print("3. Monitor specific tickers continuously")
     print("4. Demo paper trading")
+    print("5. View historical stats")
+    print("6. Reconcile settled positions & view P&L")
+    print("7. Reconcile positions with exchange")
     
-    choice = input("\nEnter choice (1-4): ").strip()
+    choice = input("\nEnter choice (1-7): ").strip()
     
     if choice == "1":
-        opportunities = bot.scan_all_markets()
+        opportunities = bot.scan_all_markets_concurrent()
         print(f"\n✅ Scan complete: Found {len(opportunities)} opportunities")
         
     elif choice == "2":
         category = input("Enter category keyword (BTC, NASDAQ, etc.): ").strip()
-        opportunities = bot.scan_all_markets(category_filter=category)
+        opportunities = bot.scan_all_markets_concurrent(category_filter=category)
         print(f"\n✅ Scan complete: Found {len(opportunities)} opportunities")
         
     elif choice == "3":
@@ -622,6 +838,18 @@ def main():
         
         trader.execute_arbitrage(demo_opportunity, quantity=10)
         trader.print_stats()
+    
+    elif choice == "5":
+        trader = KalshiTradingBot(api, initial_balance=1000.0, paper_trading=True)
+        trader.print_stats()
+    
+    elif choice == "6":
+        trader = KalshiTradingBot(api, initial_balance=1000.0, paper_trading=True)
+        trader.reconcile_positions()
+    
+    elif choice == "7":
+        trader = KalshiTradingBot(api, initial_balance=1000.0, paper_trading=True)
+        trader.reconcile_with_exchange()
     
     else:
         print("Invalid choice")
