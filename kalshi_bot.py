@@ -743,7 +743,7 @@ class KalshiArbitrageBot:
             # --- Depth-based arb check ---
             # If top-of-book isn't profitable, check if walking the book reveals arb
             if total_cost >= 100 and total_cost <= 105:
-                walk_qty = max(Config.MIN_ORDER_QUANTITY, thresholds.get('min_qty_at_best', 2))
+                walk_qty = max(Config.MIN_ORDER_QUANTITY, thresholds.get('min_qty_at_best', self.MIN_QTY_AT_BEST))
                 yes_walk = self._walk_orderbook(yes_asks, walk_qty)
                 no_walk = self._walk_orderbook(no_asks, walk_qty)
                 

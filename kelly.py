@@ -132,6 +132,10 @@ def size_position(
         kelly_fraction_val = max_fraction  # Pure arb — use max
     else:
         odds = win_prob / loss_prob
+        # Modified Kelly for known edge in arbitrage scenarios
+        # Standard Kelly is f* = (p*b - q) / b where b = odds, p = win_prob, q = 1-p
+        # For arb with known edge, we adjust: f* = edge - (1-edge)/odds
+        # This accounts for the certain profit vs execution risk tradeoff
         kelly_fraction_val = edge - (1 - edge) / odds if odds > 0 else 0
     
     # Apply fractional Kelly (half Kelly is standard for safety)
@@ -146,9 +150,10 @@ def size_position(
     # Apply duration factor — shorter markets get smaller positions
     if duration_minutes is not None and duration_minutes > 0:
         # Duration scaling formula: factor = 0.4 + (minutes / 400)
-        # This gives: 15 min → 0.4375 (~0.5x), 60 min → 0.55 (~0.8x via half-Kelly), 
-        #             240 min → 1.0x, 400+ min → 1.0x (capped)
-        # The 0.4 base ensures minimum 40% sizing for very short markets
+        # Raw scaling: 15 min → 0.4375, 60 min → 0.55, 240 min → 1.0, 400+ min → 1.0 (capped)
+        # After half-Kelly (0.5x) is applied above, this becomes:
+        #   15 min → ~0.22x final, 60 min → ~0.28x final, 240 min → ~0.5x final
+        # The 0.4 base ensures minimum 40% of the duration-adjusted Kelly for short markets
         # The 400 divisor provides gradual scaling up to ~7 hours
         duration_factor = min(1.0, 0.4 + (duration_minutes / 400))
         kelly_fraction_val *= duration_factor
