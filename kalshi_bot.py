@@ -1,5 +1,6 @@
 import requests
 import time
+import logging
 from typing import Dict, List, Optional
 from datetime import datetime, timezone
 from config import Config
@@ -10,6 +11,20 @@ from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from cryptography.hazmat.backends import default_backend
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from notifications import NotificationManager
+from kelly import size_position
+
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('kalshi_bot.log'),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger('kalshi_bot')
 
 class KalshiAPI:
     """Wrapper for Kalshi Exchange API"""
@@ -399,11 +414,12 @@ class KalshiAPI:
 class KalshiArbitrageBot:
     """Arbitrage detection bot for Kalshi"""
     
-    def __init__(self, api: KalshiAPI, min_profit_percent: float = 2.0):
+    def __init__(self, api: KalshiAPI, min_profit_percent: float = 2.0, storage=None):
         self.api = api
         self.min_profit_percent = min_profit_percent
         self.opportunities_found = []
         self.notifier = NotificationManager()
+        self.storage = storage  # Optional storage backend
     
     def _check_expiry(self, market: Dict) -> bool:
         """Return True if market settles within the allowed time window.
@@ -632,6 +648,10 @@ class KalshiArbitrageBot:
                     print(f"  ✅ OPPORTUNITY FOUND!")
                     print(f"     Profit: {opportunity['profit_cents']} cents ({opportunity['profit_percent']:.2f}%)")
                     self.notifier.notify_opportunity(opportunity)
+                    
+                    # Save to storage if available
+                    if self.storage:
+                        self.storage.save_opportunity(opportunity)
                 
                 time.sleep(0.3)
                 
@@ -845,7 +865,7 @@ class KalshiTradingBot:
     """Paper trading bot for Kalshi (simulation mode)"""
     
     def __init__(self, api: KalshiAPI, initial_balance: float = 1000.0, 
-                 paper_trading: bool = True):
+                 paper_trading: bool = True, storage=None):
         self.api = api
         self.paper_trading = paper_trading
         self.balance = initial_balance
@@ -853,13 +873,40 @@ class KalshiTradingBot:
         self.positions = []
         self.trade_history = []
         self.notifier = NotificationManager()
+        self.storage = storage  # Optional storage backend
     
-    def execute_arbitrage(self, opportunity: Dict, quantity: int = 1):
-        """Execute arbitrage trade (buy both YES and NO)""" 
+    def execute_arbitrage(self, opportunity: Dict, quantity: int = None, use_kelly: bool = False):
+        """
+        Execute arbitrage trade (buy both YES and NO).
+        
+        Args:
+            opportunity: Opportunity dict with ticker, yes_price, no_price, etc.
+            quantity: Number of contracts (if None and use_kelly=True, calculates from Kelly)
+            use_kelly: Whether to use Kelly criterion for position sizing
+        """ 
         
         ticker = opportunity['ticker']
         yes_price = opportunity['yes_price']
         no_price = opportunity['no_price']
+        
+        # Calculate quantity using Kelly if requested and not provided
+        if quantity is None and use_kelly:
+            # For arbitrage, win probability is effectively 1.0 (guaranteed profit)
+            win_prob = 0.99  # Nearly certain
+            avg_price = (yes_price + no_price) / 2
+            quantity = size_position(
+                bankroll=self.balance,
+                win_prob=win_prob,
+                contract_price_cents=int(avg_price),
+                max_trade_usd=Config.MAX_TRADE_USD,
+                kelly_multiplier=Config.KELLY_MULTIPLIER
+            )
+            logger.info("Kelly sizing calculated quantity: %d contracts", quantity)
+        
+        # Default to 1 if still None
+        if quantity is None or quantity < 1:
+            quantity = 1
+        
         total_cost = (yes_price + no_price) * quantity / 100
         
         print(f"\n{'='*60}")
@@ -888,7 +935,8 @@ class KalshiTradingBot:
                 'no_price': no_price,
                 'cost': total_cost,
                 'expected_profit': quantity - total_cost,
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.now().isoformat(),
+                'paper_trading': True
             }
 
             self.trade_history.append(trade)
@@ -898,6 +946,10 @@ class KalshiTradingBot:
             print(f"✅ Paper trade recorded")
             print(f"Remaining balance: ${self.balance:.2f}")
             self.notifier.notify_trade_executed(trade)
+            
+            # Save to storage if available
+            if self.storage:
+                self.storage.save_trade(trade)
 
         else:
             # Live trading path with safeguards
@@ -950,7 +1002,8 @@ class KalshiTradingBot:
                     'expected_profit': quantity - total_cost,
                     'timestamp': datetime.now().isoformat(),
                     'yes_order': yes_order,
-                    'no_order': no_order
+                    'no_order': no_order,
+                    'paper_trading': False
                 }
 
                 self.trade_history.append(trade)
@@ -958,6 +1011,10 @@ class KalshiTradingBot:
                 self.positions.append(trade)
                 print(f"Remaining balance: ${self.balance:.2f}")
                 self.notifier.notify_trade_executed(trade)
+                
+                # Save to storage if available
+                if self.storage:
+                    self.storage.save_trade(trade)
             else:
                 print("❌ One or both orders failed. Check API responses and the exchange UI to reconcile." )
 
@@ -1001,12 +1058,15 @@ class KalshiTradingBot:
     def reconcile_positions(self):
         """Check settled positions and calculate realized P&L."""
         if not self.positions:
-            print("No open positions to reconcile")
-            return
+            logger.debug("No open positions to reconcile")
+            return []
 
         settled = []
         for position in self.positions:
-            ticker = position['ticker']
+            ticker = position.get('ticker')
+            if not ticker:
+                continue
+                
             market = self.api.get_market(ticker)
             if market and market.get('status') in ('settled', 'closed'):
                 result = market.get('result', '')
@@ -1017,19 +1077,45 @@ class KalshiTradingBot:
                 position['settlement_result'] = result
                 position['settled_at'] = datetime.now().isoformat()
                 settled.append(position)
-                print(f"  💰 {ticker}: Settled ({result}) — P&L: ${profit:.2f}")
+                logger.info("Position settled: %s (%s) - P&L: $%.2f", ticker, result, profit)
 
         for s in settled:
             self.positions.remove(s)
             self.balance += s['quantity']  # Add payout back
             self.trade_history.append({**s, 'status': 'settled'})
+            
+            # Update storage if available
+            if self.storage:
+                # Save updated settled trade
+                self.storage.save_trade({**s, 'status': 'settled'})
 
         if settled:
-            print(f"\nSettled {len(settled)} positions")
             total_realized = sum(s.get('realized_profit', 0) for s in settled)
-            print(f"Total realized P&L: ${total_realized:.2f}")
-        else:
-            print("No positions have settled yet")
+            logger.info("Settled %d positions, total realized P&L: $%.2f", len(settled), total_realized)
+        
+        return settled
+    
+    def _capital_recycle(self):
+        """
+        Automatic capital recycling - check for settled positions and recycle capital.
+        
+        This method:
+        1. Calls reconcile_positions() to check for settled positions
+        2. Logs settled positions and realized P&L
+        3. Updates balance (already done in reconcile_positions)
+        4. Makes freed capital immediately available for next trade
+        
+        Returns:
+            Number of positions that were settled and recycled
+        """
+        logger.debug("Running capital recycle...")
+        settled = self.reconcile_positions()
+        
+        if settled:
+            total_recycled = sum(s.get('quantity', 0) for s in settled)
+            logger.info("Capital recycled: $%.2f now available for trading", total_recycled)
+        
+        return len(settled)
     
     def reconcile_with_exchange(self):
         """Compare local positions with exchange positions for consistency."""
@@ -1074,7 +1160,18 @@ def main():
     Config.print_config()
 
     api = KalshiAPI(email=Config.KALSHI_EMAIL, password=Config.KALSHI_PASSWORD, api_key=Config.KALSHI_API_KEY)
-    bot = KalshiArbitrageBot(api, min_profit_percent=Config.MIN_PROFIT_PERCENT)
+    
+    # Initialize optional storage backend
+    storage = None
+    try:
+        from storage import Storage
+        storage = Storage("kalshi_bot.db")
+        logger.info("Storage enabled - trades and opportunities will be persisted")
+    except Exception as e:
+        logger.warning("Storage not available: %s", e)
+        print("⚠️  Note: Storage disabled - trades will not be persisted to database")
+    
+    bot = KalshiArbitrageBot(api, min_profit_percent=Config.MIN_PROFIT_PERCENT, storage=storage)
     
     print("Choose mode:")
     print("1. Scan all markets once (concurrent)")
@@ -1085,8 +1182,10 @@ def main():
     print("6. Reconcile settled positions & view P&L")
     print("7. Reconcile positions with exchange")
     print("8. Continuous auto-trading scanner 🤖 (finds & executes arbitrage)")
+    print("9. Scan crypto markets for probability edge (BTC/ETH interval markets)")
+    print("10. Auto-trade crypto probability strategy (continuous loop)")
     
-    choice = input("\nEnter choice (1-8): ").strip()
+    choice = input("\nEnter choice (1-10): ").strip()
     
     if choice == "1":
         opportunities = bot.scan_all_markets_concurrent()
@@ -1104,7 +1203,7 @@ def main():
         bot.monitor_specific_markets(tickers, interval=60)
         
     elif choice == "4":
-        trader = KalshiTradingBot(api, initial_balance=1000.0, paper_trading=True)
+        trader = KalshiTradingBot(api, initial_balance=1000.0, paper_trading=True, storage=storage)
         
         demo_opportunity = {
             'ticker': 'DEMO-TICKER',
@@ -1120,15 +1219,15 @@ def main():
         trader.print_stats()
     
     elif choice == "5":
-        trader = KalshiTradingBot(api, initial_balance=1000.0, paper_trading=True)
+        trader = KalshiTradingBot(api, initial_balance=1000.0, paper_trading=True, storage=storage)
         trader.print_stats()
     
     elif choice == "6":
-        trader = KalshiTradingBot(api, initial_balance=1000.0, paper_trading=True)
+        trader = KalshiTradingBot(api, initial_balance=1000.0, paper_trading=True, storage=storage)
         trader.reconcile_positions()
     
     elif choice == "7":
-        trader = KalshiTradingBot(api, initial_balance=1000.0, paper_trading=True)
+        trader = KalshiTradingBot(api, initial_balance=1000.0, paper_trading=True, storage=storage)
         trader.reconcile_with_exchange()
     
     elif choice == "8":
@@ -1149,7 +1248,8 @@ def main():
         trader = KalshiTradingBot(
             api, 
             initial_balance=starting_balance,
-            paper_trading=not Config.LIVE_TRADING_ENABLED
+            paper_trading=not Config.LIVE_TRADING_ENABLED,
+            storage=storage
         )
         
         iteration = 0
@@ -1254,6 +1354,12 @@ def main():
                 # Wait for next scan
                 print(f"\n⏳ Waiting {Config.SCAN_INTERVAL_SECONDS}s until next scan...")
                 print(f"Total scans: {iteration} | Total trades: {len(trader.trade_history)}")
+                
+                # Capital recycling - check for settled positions
+                recycled = trader._capital_recycle()
+                if recycled > 0:
+                    print(f"♻️  Recycled capital from {recycled} settled positions")
+                
                 time.sleep(Config.SCAN_INTERVAL_SECONDS)
                 
         except KeyboardInterrupt:
@@ -1265,6 +1371,179 @@ def main():
             print(f"- Total scans: {iteration}")
             print(f"- Total opportunities found: {len(bot.opportunities_found)}")
             print(f"- Total trades executed: {len(trader.trade_history)}")
+            print(f"{'='*60}")
+    
+    elif choice == "9":
+        # Scan crypto markets for probability edge
+        from probability_trader import ProbabilityTrader
+        
+        print("\n" + "="*60)
+        print("📊 SCANNING CRYPTO MARKETS FOR PROBABILITY EDGE")
+        print("="*60)
+        print(f"Min edge required: {Config.MIN_EDGE_PERCENT}%")
+        print(f"BTC vol estimate: {Config.BTC_15MIN_VOL*100:.2f}%")
+        print(f"ETH vol estimate: {Config.ETH_15MIN_VOL*100:.2f}%")
+        print("="*60 + "\n")
+        
+        prob_trader = ProbabilityTrader(api, Config)
+        opportunities = prob_trader.scan_crypto_markets()
+        
+        if opportunities:
+            print(f"\n✅ Found {len(opportunities)} probability opportunities:\n")
+            for i, opp in enumerate(opportunities, 1):
+                print(f"{i}. {opp['ticker']} - {opp['strategy']}")
+                print(f"   Side: {opp['side'].upper()} at {opp['price']}¢")
+                print(f"   Edge: {opp['edge_percent']:.2f}% (est. prob: {opp['estimated_prob']*100:.1f}%, implied: {opp['implied_prob']*100:.1f}%)")
+                print(f"   Kelly fraction: {opp['kelly_fraction']:.3f}")
+                print(f"   Max qty: {opp['max_executable_qty']} | Time left: {opp['minutes_remaining']:.1f} min")
+                print()
+        else:
+            print("\n📊 No probability edge opportunities found")
+    
+    elif choice == "10":
+        # Continuous auto-trading for probability strategy
+        from probability_trader import ProbabilityTrader
+        from kelly import size_position
+        
+        print("\n" + "="*60)
+        print("🤖 CONTINUOUS PROBABILITY AUTO-TRADING")
+        print("="*60)
+        print(f"Scan interval: 15 seconds (fast for crypto)")
+        print(f"Min edge: {Config.MIN_EDGE_PERCENT}%")
+        print(f"Kelly multiplier: {Config.KELLY_MULTIPLIER} (half-Kelly)")
+        print(f"Live trading: {'ENABLED ⚠️' if Config.LIVE_TRADING_ENABLED else 'DISABLED (paper only)'}")
+        print(f"Max trade: ${Config.MAX_TRADE_USD}")
+        print(f"Press Ctrl+C to stop")
+        print("="*60 + "\n")
+        
+        # Initialize trader
+        starting_balance = api.get_balance() if Config.LIVE_TRADING_ENABLED else 250.0
+        trader = KalshiTradingBot(
+            api,
+            initial_balance=starting_balance,
+            paper_trading=not Config.LIVE_TRADING_ENABLED,
+            storage=storage
+        )
+        
+        prob_trader = ProbabilityTrader(api, Config)
+        
+        iteration = 0
+        try:
+            while True:
+                iteration += 1
+                print(f"\n{'='*60}")
+                print(f"Probability Scan #{iteration} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"{'='*60}")
+                
+                # Scan for probability opportunities
+                opportunities = prob_trader.scan_crypto_markets()
+                
+                if opportunities:
+                    # Sort by edge descending
+                    opportunities.sort(key=lambda o: o.get('edge_percent', 0), reverse=True)
+                    print(f"\n✅ Found {len(opportunities)} probability opportunities")
+                    
+                    for opp in opportunities:
+                        ticker = opp['ticker']
+                        side = opp['side']
+                        price = opp['price']
+                        edge_pct = opp['edge_percent']
+                        est_prob = opp['estimated_prob']
+                        
+                        # Calculate position size using Kelly
+                        quantity = size_position(
+                            bankroll=trader.balance,
+                            win_prob=est_prob,
+                            contract_price_cents=price,
+                            max_trade_usd=Config.MAX_TRADE_USD,
+                            kelly_multiplier=Config.KELLY_MULTIPLIER
+                        )
+                        
+                        # Limit to orderbook depth
+                        quantity = min(quantity, opp.get('max_executable_qty', 1))
+                        
+                        if quantity < 1:
+                            print(f"\n⚠️ {ticker}: Insufficient balance for trade")
+                            continue
+                        
+                        cost_usd = (price * quantity) / 100.0
+                        expected_profit = ((1.0 - price/100.0) * est_prob - (price/100.0) * (1-est_prob)) * quantity
+                        
+                        print(f"\n🎯 {ticker} - {opp['strategy']}")
+                        print(f"   {side.upper()} @ {price}¢ x {quantity} = ${cost_usd:.2f}")
+                        print(f"   Edge: {edge_pct:.2f}% | Expected profit: ${expected_profit:.2f}")
+                        
+                        # Execute trade (paper or live)
+                        if trader.paper_trading:
+                            trade = {
+                                'ticker': ticker,
+                                'type': 'probability',
+                                'side': side,
+                                'quantity': quantity,
+                                'price': price,
+                                'cost': cost_usd,
+                                'expected_profit': expected_profit,
+                                'edge_percent': edge_pct,
+                                'timestamp': datetime.now().isoformat()
+                            }
+                            trader.trade_history.append(trade)
+                            trader.balance -= cost_usd
+                            trader.positions.append(trade)
+                            print(f"   📄 Paper trade recorded")
+                        else:
+                            # Live trading
+                            if cost_usd > Config.MAX_TRADE_USD:
+                                print(f"   ⚠️ Exceeds max trade size")
+                                continue
+                            
+                            if len(trader.positions) >= Config.MAX_POSITIONS:
+                                print(f"   ⚠️ Position limit reached")
+                                continue
+                            
+                            order = api.place_order(ticker, side, quantity, price, order_type='limit')
+                            if order:
+                                trade = {
+                                    'ticker': ticker,
+                                    'type': 'probability',
+                                    'side': side,
+                                    'quantity': quantity,
+                                    'price': price,
+                                    'cost': cost_usd,
+                                    'expected_profit': expected_profit,
+                                    'edge_percent': edge_pct,
+                                    'timestamp': datetime.now().isoformat(),
+                                    'order': order
+                                }
+                                trader.trade_history.append(trade)
+                                trader.balance -= cost_usd
+                                trader.positions.append(trade)
+                                print(f"   ✅ Live order placed")
+                            else:
+                                print(f"   ❌ Order failed")
+                        
+                        time.sleep(0.5)
+                else:
+                    print(f"\n📊 No probability opportunities found this scan")
+                
+                # Print stats
+                trader.print_stats()
+                
+                # Capital recycling
+                recycled = trader._capital_recycle()
+                if recycled > 0:
+                    print(f"♻️  Recycled capital from {recycled} settled positions")
+                
+                # Wait for next scan (15 seconds for fast crypto markets)
+                print(f"\n⏳ Waiting 15 seconds until next scan...")
+                time.sleep(15)
+                
+        except KeyboardInterrupt:
+            print(f"\n\n{'='*60}")
+            print("🛑 Probability scanner stopped by user")
+            print(f"{'='*60}")
+            trader.print_stats()
+            print(f"\nTotal probability scans: {iteration}")
+            print(f"Total trades: {len(trader.trade_history)}")
             print(f"{'='*60}")
     
     else:
