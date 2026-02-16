@@ -142,32 +142,38 @@ class KalshiAPI:
             print(f"❌ Login error: {e}")
             return False
     
-    def get_markets(self, status: str = "open", limit: int = 100) -> List[Dict]:
-        """Fetch active markets"""
-        try:
-            endpoint = f"{self.BASE_URL}/markets"
-            params = {
-                'status': status,
-                'limit': limit
-            }
-            # construct path without query for signing
+    def get_markets(self, status: str = "open", limit: int = 100, max_markets: int = 1000) -> List[Dict]:
+        """Fetch active markets with automatic pagination."""
+        all_markets = []
+        cursor = None
+
+        while len(all_markets) < max_markets:
+            params = {'status': status, 'limit': min(limit, max_markets - len(all_markets))}
+            if cursor:
+                params['cursor'] = cursor
+
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
             path = f"{path_prefix}/markets"
             headers = self._signed_headers('GET', path)
-            response = self.session.get(endpoint, params=params, headers=headers if headers else None)
             
-            if response.status_code == 200:
-                data = response.json()
-                return data.get('markets', [])
-            else:
-                print(f"Error fetching markets: {response.status_code}")
-                if response.status_code == 401:
-                    body = response.text[:200] if response.text else '(empty)'
-                    print(f"  Response body: {body}")
-                return []
-        except Exception as e:
-            print(f"Error: {e}")
-            return []
+            try:
+                response = self.session.get(f"{self.BASE_URL}/markets", params=params, headers=headers if headers else None)
+                if response.status_code == 200:
+                    data = response.json()
+                    markets = data.get('markets', [])
+                    all_markets.extend(markets)
+                    cursor = data.get('cursor')
+                    if not cursor or not markets:
+                        break
+                    time.sleep(Config.RATE_LIMIT_DELAY)
+                else:
+                    print(f"Error fetching markets: {response.status_code}")
+                    break
+            except Exception as e:
+                print(f"Error: {e}")
+                break
+
+        return all_markets
     
     def get_market(self, ticker: str) -> Optional[Dict]:
         """Get specific market by ticker"""
@@ -284,6 +290,68 @@ class KalshiAPI:
             print(f"Error placing order: {e}")
             return None
 
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel an open order by order_id."""
+        try:
+            endpoint = f"{self.BASE_URL}/portfolio/orders/{order_id}"
+            path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
+            path = f"{path_prefix}/portfolio/orders/{order_id}"
+            headers = self._signed_headers('DELETE', path)
+            response = self.session.delete(endpoint, headers=headers if headers else None)
+            if response.status_code in (200, 204):
+                return True
+            else:
+                print(f"Cancel order failed: {response.status_code} - {response.text}")
+                return False
+        except Exception as e:
+            print(f"Error cancelling order: {e}")
+            return False
+
+    def get_order(self, order_id: str) -> Optional[Dict]:
+        """Get order status by order_id."""
+        try:
+            endpoint = f"{self.BASE_URL}/portfolio/orders/{order_id}"
+            path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
+            path = f"{path_prefix}/portfolio/orders/{order_id}"
+            headers = self._signed_headers('GET', path)
+            response = self.session.get(endpoint, headers=headers if headers else None)
+            if response.status_code == 200:
+                return response.json().get('order')
+            return None
+        except Exception as e:
+            print(f"Error fetching order: {e}")
+            return None
+
+    def get_positions(self) -> List[Dict]:
+        """Get current portfolio positions for reconciliation."""
+        try:
+            endpoint = f"{self.BASE_URL}/portfolio/positions"
+            path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
+            path = f"{path_prefix}/portfolio/positions"
+            headers = self._signed_headers('GET', path)
+            response = self.session.get(endpoint, headers=headers if headers else None)
+            if response.status_code == 200:
+                return response.json().get('market_positions', [])
+            return []
+        except Exception as e:
+            print(f"Error fetching positions: {e}")
+            return []
+
+    def get_event(self, event_ticker: str) -> Optional[Dict]:
+        """Get event details."""
+        try:
+            endpoint = f"{self.BASE_URL}/events/{event_ticker}"
+            path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
+            path = f"{path_prefix}/events/{event_ticker}"
+            headers = self._signed_headers('GET', path)
+            response = self.session.get(endpoint, headers=headers if headers else None)
+            if response.status_code == 200:
+                return response.json().get('event')
+            return None
+        except Exception as e:
+            print(f"Error fetching event {event_ticker}: {e}")
+            return None
+
 
 class KalshiArbitrageBot:
     """Arbitrage detection bot for Kalshi"""
@@ -294,26 +362,36 @@ class KalshiArbitrageBot:
         self.opportunities_found = []
     
     def analyze_market_mispricing(self, market: Dict, orderbook: Dict) -> Optional[Dict]:
-        """
-        Detect mispricing in a single market
-        YES + NO should equal 100 cents, look for deviations
-        """
+        """Detect mispricing in a single market with depth/liquidity checks."""
         try:
             yes_asks = orderbook.get('yes_asks', [])
             no_asks = orderbook.get('no_asks', [])
-            
+
             if not yes_asks or not no_asks:
                 return None
-            
-            best_yes_ask = min([ask[0] for ask in yes_asks])
-            best_no_ask = min([ask[0] for ask in no_asks])
-            
+
+            min_qty = Config.MIN_ORDER_QUANTITY
+
+            # Filter asks with sufficient depth
+            yes_asks_filtered = [(price, qty) for price, qty in yes_asks if qty >= min_qty]
+            no_asks_filtered = [(price, qty) for price, qty in no_asks if qty >= min_qty]
+
+            if not yes_asks_filtered or not no_asks_filtered:
+                return None
+
+            best_yes = min(yes_asks_filtered, key=lambda x: x[0])
+            best_no = min(no_asks_filtered, key=lambda x: x[0])
+
+            best_yes_ask = best_yes[0]
+            best_no_ask = best_no[0]
+            max_executable_qty = min(best_yes[1], best_no[1])
+
             total_cost = best_yes_ask + best_no_ask
             guaranteed_payout = 100
-            
+
             profit = guaranteed_payout - total_cost
             profit_percent = (profit / total_cost) * 100
-            
+
             if profit_percent > self.min_profit_percent:
                 return {
                     'ticker': market.get('ticker'),
@@ -323,12 +401,13 @@ class KalshiArbitrageBot:
                     'total_cost': total_cost,
                     'profit_cents': profit,
                     'profit_percent': profit_percent,
+                    'max_executable_qty': max_executable_qty,
                     'strategy': 'Buy both YES and NO, guaranteed profit on settlement',
                     'timestamp': datetime.now().isoformat()
                 }
-            
+
             return None
-            
+
         except Exception as e:
             print(f"Error analyzing market: {e}")
             return None
@@ -366,12 +445,92 @@ class KalshiArbitrageBot:
                     print(f"  ✅ OPPORTUNITY FOUND!")
                     print(f"     Profit: {opportunity['profit_cents']} cents ({opportunity['profit_percent']:.2f}%)")
                 
-                time.sleep(0.3)
+                time.sleep(Config.RATE_LIMIT_DELAY)
                 
             except Exception as e:
                 print(f"  Error scanning {ticker}: {e}")
                 continue
         
+        return opportunities
+
+    def scan_multi_leg_arbitrage(self) -> List[Dict]:
+        """Scan for cross-market arbitrage within events.
+        
+        Groups markets by event_ticker, checks if sum of best YES asks
+        across all outcomes < 100 cents (guaranteed profit by buying all).
+        """
+        print("🔍 Scanning for multi-leg arbitrage opportunities...")
+
+        markets = self.api.get_markets(status="open")
+        print(f"Found {len(markets)} open markets")
+
+        # Group by event_ticker
+        events = {}
+        for market in markets:
+            event_ticker = market.get('event_ticker')
+            if event_ticker:
+                events.setdefault(event_ticker, []).append(market)
+
+        opportunities = []
+        scanned_events = 0
+
+        for event_ticker, event_markets in events.items():
+            if len(event_markets) < 2:
+                continue
+
+            scanned_events += 1
+            print(f"Scanning event {scanned_events}: {event_ticker} ({len(event_markets)} markets)...")
+
+            total_cost = 0
+            legs = []
+            valid = True
+
+            for market in event_markets:
+                orderbook = self.api.get_orderbook(market['ticker'])
+                yes_asks = orderbook.get('yes_asks', [])
+                if not yes_asks:
+                    valid = False
+                    break
+
+                # Filter by minimum quantity
+                filtered = [(p, q) for p, q in yes_asks if q >= Config.MIN_ORDER_QUANTITY]
+                if not filtered:
+                    valid = False
+                    break
+
+                best = min(filtered, key=lambda x: x[0])
+                total_cost += best[0]
+                legs.append({
+                    'ticker': market['ticker'],
+                    'title': market.get('title'),
+                    'yes_price': best[0],
+                    'quantity_available': best[1]
+                })
+                time.sleep(Config.RATE_LIMIT_DELAY)
+
+            if not valid:
+                continue
+
+            profit = 100 - total_cost
+            if total_cost < 100 and profit > 0:
+                profit_pct = (profit / total_cost) * 100
+                if profit_pct > self.min_profit_percent:
+                    opp = {
+                        'type': 'multi_leg',
+                        'event_ticker': event_ticker,
+                        'num_legs': len(legs),
+                        'legs': legs,
+                        'total_cost': total_cost,
+                        'profit_cents': profit,
+                        'profit_percent': profit_pct,
+                        'max_executable_qty': min(leg['quantity_available'] for leg in legs),
+                        'strategy': f'Buy YES on all {len(legs)} outcomes — one must settle YES',
+                        'timestamp': datetime.now().isoformat()
+                    }
+                    opportunities.append(opp)
+                    print(f"  ✅ MULTI-LEG OPPORTUNITY! {len(legs)} legs, profit {profit}¢ ({profit_pct:.2f}%)")
+
+        print(f"\nScanned {scanned_events} multi-market events")
         return opportunities
     
     def monitor_specific_markets(self, tickers: List[str], interval: int = 60):
@@ -410,7 +569,7 @@ class KalshiArbitrageBot:
                         else:
                             print(f"✓ {ticker}: No opportunity (spread too small)")
                         
-                        time.sleep(0.5)
+                        time.sleep(Config.RATE_LIMIT_DELAY)
                         
                     except Exception as e:
                         print(f"Error monitoring {ticker}: {e}")
@@ -505,31 +664,43 @@ class KalshiTradingBot:
 
             print("Placing YES order...")
             yes_order = self.api.place_order(ticker, 'yes', quantity, yes_price, order_type='limit')
+
+            if not yes_order:
+                print("❌ YES order failed. No orders placed.")
+                return False
+
             print("Placing NO order...")
             no_order = self.api.place_order(ticker, 'no', quantity, no_price, order_type='limit')
 
-            if yes_order and no_order:
-                print("✅ Both orders placed successfully (check exchange for order IDs)")
+            if not no_order:
+                # YES succeeded but NO failed — cancel YES to avoid naked exposure
+                yes_order_id = yes_order.get('order_id')
+                print(f"❌ NO order failed! Cancelling YES order {yes_order_id} to prevent naked exposure...")
+                if self.api.cancel_order(yes_order_id):
+                    print("✅ YES order cancelled successfully. No exposure.")
+                else:
+                    print("⚠️  CRITICAL: Failed to cancel YES order! Manual intervention required!")
+                    print(f"   Order ID: {yes_order_id} | Ticker: {ticker}")
+                return False
 
-                trade = {
-                    'ticker': ticker,
-                    'type': 'arbitrage',
-                    'quantity': quantity,
-                    'yes_price': yes_price,
-                    'no_price': no_price,
-                    'cost': total_cost,
-                    'expected_profit': quantity - total_cost,
-                    'timestamp': datetime.now().isoformat(),
-                    'yes_order': yes_order,
-                    'no_order': no_order
-                }
-
-                self.trade_history.append(trade)
-                self.balance -= total_cost
-                self.positions.append(trade)
-                print(f"Remaining balance: ${self.balance:.2f}")
-            else:
-                print("❌ One or both orders failed. Check API responses and the exchange UI to reconcile." )
+            # Both orders succeeded
+            print("✅ Both orders placed successfully")
+            trade = {
+                'ticker': ticker,
+                'type': 'arbitrage',
+                'quantity': quantity,
+                'yes_price': yes_price,
+                'no_price': no_price,
+                'cost': total_cost,
+                'expected_profit': quantity - total_cost,
+                'timestamp': datetime.now().isoformat(),
+                'yes_order': yes_order,
+                'no_order': no_order
+            }
+            self.trade_history.append(trade)
+            self.balance -= total_cost
+            self.positions.append(trade)
+            print(f"Remaining balance: ${self.balance:.2f}")
 
         return True
     
@@ -589,8 +760,9 @@ def main():
     print("2. Scan specific category (e.g., BTC, NASDAQ)")
     print("3. Monitor specific tickers continuously")
     print("4. Demo paper trading")
+    print("5. Scan multi-leg arbitrage across events")
     
-    choice = input("\nEnter choice (1-4): ").strip()
+    choice = input("\nEnter choice (1-5): ").strip()
     
     if choice == "1":
         opportunities = bot.scan_all_markets()
@@ -622,6 +794,15 @@ def main():
         
         trader.execute_arbitrage(demo_opportunity, quantity=10)
         trader.print_stats()
+
+    elif choice == "5":
+        opportunities = bot.scan_multi_leg_arbitrage()
+        print(f"\n✅ Multi-leg scan complete: Found {len(opportunities)} opportunities")
+        for i, opp in enumerate(opportunities, 1):
+            print(f"\n{i}. Event: {opp['event_ticker']}")
+            print(f"   Legs: {opp['num_legs']} | Cost: {opp['total_cost']}¢ | Profit: {opp['profit_cents']}¢ ({opp['profit_percent']:.2f}%)")
+            for leg in opp['legs']:
+                print(f"     - {leg['ticker']}: YES @ {leg['yes_price']}¢ (qty: {leg['quantity_available']})")
     
     else:
         print("Invalid choice")
