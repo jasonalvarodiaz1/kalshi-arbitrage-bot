@@ -132,10 +132,11 @@ def size_position(
         kelly_fraction_val = max_fraction  # Pure arb — use max
     else:
         odds = win_prob / loss_prob
-        # Modified Kelly for known edge in arbitrage scenarios
-        # Standard Kelly is f* = (p*b - q) / b where b = odds, p = win_prob, q = 1-p
-        # For arb with known edge, we adjust: f* = edge - (1-edge)/odds
-        # This accounts for the certain profit vs execution risk tradeoff
+        # Kelly sizing for arbitrage with execution risk:
+        # We use a conservative variant: f* = edge - (1-edge)/odds
+        # This reduces position size to account for slippage and fill risk
+        # while still scaling with the known edge. More conservative than
+        # the standard f* = edge/odds for uncertain outcomes.
         kelly_fraction_val = edge - (1 - edge) / odds if odds > 0 else 0
     
     # Apply fractional Kelly (half Kelly is standard for safety)
@@ -149,12 +150,12 @@ def size_position(
     
     # Apply duration factor — shorter markets get smaller positions
     if duration_minutes is not None and duration_minutes > 0:
-        # Duration scaling formula: factor = 0.4 + (minutes / 400)
-        # Raw scaling: 15 min → 0.4375, 60 min → 0.55, 240 min → 1.0, 400+ min → 1.0 (capped)
-        # After half-Kelly (0.5x) is applied above, this becomes:
-        #   15 min → ~0.22x final, 60 min → ~0.28x final, 240 min → ~0.5x final
-        # The 0.4 base ensures minimum 40% of the duration-adjusted Kelly for short markets
-        # The 400 divisor provides gradual scaling up to ~7 hours
+        # Duration scaling formula: factor = min(1.0, 0.4 + minutes/400)
+        # Examples: 15 min → 0.4375, 60 min → 0.55, 240 min → 1.0 (hits cap)
+        # The min(1.0, ...) caps scaling at 1.0x for markets ≥240 minutes
+        # After half-Kelly (0.5x) is applied above, final scaling becomes:
+        #   15 min → ~0.22x, 60 min → ~0.28x, 240+ min → ~0.5x
+        # The 0.4 base ensures minimum 40% of duration factor for very short markets
         duration_factor = min(1.0, 0.4 + (duration_minutes / 400))
         kelly_fraction_val *= duration_factor
     
