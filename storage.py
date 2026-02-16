@@ -4,7 +4,12 @@ from datetime import datetime
 from typing import List, Dict, Optional
 
 class Storage:
-    """SQLite storage for trade history and opportunity tracking."""
+    """SQLite storage for trade history and opportunity tracking.
+    
+    Note: While check_same_thread=False is set, each thread should create
+    its own Storage instance for thread safety. Sharing a single instance
+    across threads may lead to race conditions.
+    """
 
     def __init__(self, db_path: str = "kalshi_bot.db"):
         self.db_path = db_path

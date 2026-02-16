@@ -193,9 +193,6 @@ class KalshiAPI:
 
         while len(all_markets) < max_markets:
             remaining = max_markets - len(all_markets)
-            if remaining <= 0:
-                break
-            
             params = {'status': status, 'limit': min(limit, remaining)}
             if cursor:
                 params['cursor'] = cursor
@@ -794,7 +791,7 @@ class KalshiTradingBot:
 
 
 def main():
-    """Main function""" 
+    """Main function - requires interactive terminal for user input""" 
     
     logger.info(f"\n{'='*60}")
     logger.info(f"🤖 KALSHI ARBITRAGE BOT - Educational Version")
