@@ -192,7 +192,11 @@ class KalshiAPI:
         cursor = None
 
         while len(all_markets) < max_markets:
-            params = {'status': status, 'limit': min(limit, max_markets - len(all_markets))}
+            remaining = max_markets - len(all_markets)
+            if remaining <= 0:
+                break
+            
+            params = {'status': status, 'limit': min(limit, remaining)}
             if cursor:
                 params['cursor'] = cursor
 

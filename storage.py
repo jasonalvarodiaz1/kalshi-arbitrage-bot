@@ -8,9 +8,16 @@ class Storage:
 
     def __init__(self, db_path: str = "kalshi_bot.db"):
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._create_tables()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
     def _create_tables(self):
         cursor = self.conn.cursor()
