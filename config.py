@@ -38,6 +38,10 @@ class Config:
     MAX_POSITIONS = int(os.getenv('MAX_POSITIONS', 10))
     MAX_EXPOSURE_USD = float(os.getenv('MAX_EXPOSURE_USD', 500.0))
     
+    # Exposure limits
+    MAX_EVENT_EXPOSURE_PCT = float(os.getenv('MAX_EVENT_EXPOSURE_PCT', 20.0))  # Max % of bankroll in one event
+    MAX_CATEGORY_EXPOSURE_PCT = float(os.getenv('MAX_CATEGORY_EXPOSURE_PCT', 40.0))  # Max % in one category (crypto, politics, etc.)
+    
     # API Settings
     BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
     RATE_LIMIT_DELAY = 0.3  # Seconds between requests
@@ -68,6 +72,8 @@ class Config:
         print(f"  Authenticated: {auth_state}")
         print(f"  Live Trading Enabled: {cls.LIVE_TRADING_ENABLED}")
         print(f"  Max Trade USD: ${cls.MAX_TRADE_USD:.2f}")
+        print(f"  Max Event Exposure: {cls.MAX_EVENT_EXPOSURE_PCT}%")
+        print(f"  Max Category Exposure: {cls.MAX_CATEGORY_EXPOSURE_PCT}%")
         # Do not print private key contents
         print(f"  Private Key Path: {cls.KALSHI_PRIVATE_KEY_PATH or 'not set'}")
 
