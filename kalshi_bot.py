@@ -8,6 +8,27 @@ import base64
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from cryptography.hazmat.backends import default_backend
+import logging
+from logging.handlers import RotatingFileHandler
+from storage import Storage
+
+def setup_logging():
+    logger = logging.getLogger('kalshi_bot')
+    logger.setLevel(logging.DEBUG)
+
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(logging.Formatter('%(message)s'))
+
+    file_handler = RotatingFileHandler('kalshi_bot.log', maxBytes=5*1024*1024, backupCount=5)
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
+
+    logger.addHandler(console)
+    logger.addHandler(file_handler)
+    return logger
+
+logger = setup_logging()
 
 class KalshiAPI:
     """Wrapper for Kalshi Exchange API"""
@@ -39,18 +60,18 @@ class KalshiAPI:
                     password=None,
                     backend=default_backend()
                 )
-                print("✅ Private key loaded from file")
+                logger.info("✅ Private key loaded from file")
             except Exception as e:
-                print(f"❌ Failed to load private key: {e}")
+                logger.error(f"❌ Failed to load private key: {e}")
 
         # Determine auth method
         if self.api_key and self.private_key:
             # Use Kalshi signed-header auth (per docs)
             # Test which base URL + salt length works
             if self._test_auth():
-                print(f"✅ Authenticated with signed headers (base: {self.BASE_URL})")
+                logger.info(f"✅ Authenticated with signed headers (base: {self.BASE_URL})")
             else:
-                print("⚠️  Signed-header auth failed on both prod and demo URLs with both salt lengths")
+                logger.warning("⚠️  Signed-header auth failed on both prod and demo URLs with both salt lengths")
         elif email and password:
             self.login()
 
@@ -64,25 +85,25 @@ class KalshiAPI:
                 self.BASE_URL = base_url
                 self.salt_length = salt
                 salt_name = 'DIGEST_LENGTH' if salt == asym_padding.PSS.DIGEST_LENGTH else 'MAX_LENGTH'
-                print(f"  Trying: {base_url} with salt={salt_name}...")
+                logger.debug(f"  Trying: {base_url} with salt={salt_name}...")
 
                 path = urlparse(base_url).path.rstrip('/') + '/markets'
                 headers = self._signed_headers('GET', path)
                 if not headers:
-                    print(f"    Skipped (no headers generated)")
+                    logger.debug(f"    Skipped (no headers generated)")
                     continue
 
                 try:
                     resp = self.session.get(f"{base_url}/markets", params={'limit': 1}, headers=headers)
-                    print(f"    Response: {resp.status_code}")
+                    logger.debug(f"    Response: {resp.status_code}")
                     if resp.status_code == 200:
                         return True
                     else:
                         # Show response body for debugging
                         body = resp.text[:200] if resp.text else '(empty)'
-                        print(f"    Body: {body}")
+                        logger.debug(f"    Body: {body}")
                 except Exception as e:
-                    print(f"    Error: {e}")
+                    logger.debug(f"    Error: {e}")
 
         return False
 
@@ -117,6 +138,29 @@ class KalshiAPI:
             'KALSHI-ACCESS-SIGNATURE': sig_b64
         }
     
+    def _request_with_retry(self, method: str, url: str, max_retries: int = 3, **kwargs) -> Optional[requests.Response]:
+        """Make an HTTP request with exponential backoff retry."""
+        for attempt in range(max_retries):
+            try:
+                response = getattr(self.session, method.lower())(url, **kwargs)
+                if response.status_code == 429:
+                    wait = (2 ** attempt) + 1
+                    logger.warning(f"Rate limited (429). Retrying in {wait}s (attempt {attempt + 1}/{max_retries})...")
+                    time.sleep(wait)
+                    continue
+                if response.status_code >= 500:
+                    wait = (2 ** attempt) + 1
+                    logger.warning(f"Server error ({response.status_code}). Retrying in {wait}s (attempt {attempt + 1}/{max_retries})...")
+                    time.sleep(wait)
+                    continue
+                return response
+            except requests.exceptions.RequestException as e:
+                wait = (2 ** attempt) + 1
+                logger.warning(f"Request failed: {e}. Retrying in {wait}s (attempt {attempt + 1}/{max_retries})...")
+                time.sleep(wait)
+        logger.error(f"All {max_retries} retry attempts failed for {method} {url}")
+        return None
+    
     def login(self) -> bool:
         """Authenticate with Kalshi"""
         try:
@@ -125,21 +169,21 @@ class KalshiAPI:
                 "email": self.email,
                 "password": self.password
             }
-            response = self.session.post(endpoint, json=payload)
+            response = self._request_with_retry('post', endpoint, json=payload)
             
-            if response.status_code == 200:
+            if response and response.status_code == 200:
                 data = response.json()
                 self.token = data.get('token')
                 self.session.headers.update({
                     'Authorization': f'Bearer {self.token}'
                 })
-                print("✅ Successfully logged in to Kalshi")
+                logger.info("✅ Successfully logged in to Kalshi")
                 return True
             else:
-                print(f"❌ Login failed: {response.status_code}")
+                logger.error(f"❌ Login failed: {response.status_code if response else 'No response'}")
                 return False
         except Exception as e:
-            print(f"❌ Login error: {e}")
+            logger.error(f"❌ Login error: {e}")
             return False
     
     def get_markets(self, status: str = "open", limit: int = 100, max_markets: int = 1000) -> List[Dict]:
@@ -157,8 +201,8 @@ class KalshiAPI:
             headers = self._signed_headers('GET', path)
             
             try:
-                response = self.session.get(f"{self.BASE_URL}/markets", params=params, headers=headers if headers else None)
-                if response.status_code == 200:
+                response = self._request_with_retry('get', f"{self.BASE_URL}/markets", params=params, headers=headers if headers else None)
+                if response and response.status_code == 200:
                     data = response.json()
                     markets = data.get('markets', [])
                     all_markets.extend(markets)
@@ -167,10 +211,10 @@ class KalshiAPI:
                         break
                     time.sleep(Config.RATE_LIMIT_DELAY)
                 else:
-                    print(f"Error fetching markets: {response.status_code}")
+                    logger.error(f"Error fetching markets: {response.status_code if response else 'No response'}")
                     break
             except Exception as e:
-                print(f"Error: {e}")
+                logger.error(f"Error: {e}")
                 break
 
         return all_markets
@@ -182,13 +226,13 @@ class KalshiAPI:
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
             path = f"{path_prefix}/markets/{ticker}"
             headers = self._signed_headers('GET', path)
-            response = self.session.get(endpoint, headers=headers if headers else None)
+            response = self._request_with_retry('get', endpoint, headers=headers if headers else None)
             
-            if response.status_code == 200:
+            if response and response.status_code == 200:
                 return response.json().get('market')
             return None
         except Exception as e:
-            print(f"Error fetching market {ticker}: {e}")
+            logger.error(f"Error fetching market {ticker}: {e}")
             return None
     
     def get_orderbook(self, ticker: str) -> Dict:
@@ -198,9 +242,9 @@ class KalshiAPI:
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
             path = f"{path_prefix}/markets/{ticker}/orderbook"
             headers = self._signed_headers('GET', path)
-            response = self.session.get(endpoint, headers=headers if headers else None)
+            response = self._request_with_retry('get', endpoint, headers=headers if headers else None)
             
-            if response.status_code == 200:
+            if response and response.status_code == 200:
                 data = response.json()
                 return {
                     'yes_bids': data.get('yes', {}).get('bids', []),
@@ -211,7 +255,7 @@ class KalshiAPI:
                 }
             return {}
         except Exception as e:
-            print(f"Error fetching orderbook: {e}")
+            logger.error(f"Error fetching orderbook: {e}")
             return {}
     
     def get_trades(self, ticker: str, limit: int = 100) -> List[Dict]:
@@ -222,13 +266,13 @@ class KalshiAPI:
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
             path = f"{path_prefix}/markets/{ticker}/trades"
             headers = self._signed_headers('GET', path)
-            response = self.session.get(endpoint, params=params, headers=headers if headers else None)
+            response = self._request_with_retry('get', endpoint, params=params, headers=headers if headers else None)
             
-            if response.status_code == 200:
+            if response and response.status_code == 200:
                 return response.json().get('trades', [])
             return []
         except Exception as e:
-            print(f"Error fetching trades: {e}")
+            logger.error(f"Error fetching trades: {e}")
             return []
 
     # try_private_key_auth removed — replaced by _test_auth() + _signed_headers()
@@ -240,14 +284,14 @@ class KalshiAPI:
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
             path = f"{path_prefix}/portfolio/balance"
             headers = self._signed_headers('GET', path)
-            response = self.session.get(endpoint, headers=headers if headers else None)
+            response = self._request_with_retry('get', endpoint, headers=headers if headers else None)
             
-            if response.status_code == 200:
+            if response and response.status_code == 200:
                 data = response.json()
                 return float(data.get('balance', 0)) / 100  # Kalshi uses cents
             return 0.0
         except Exception as e:
-            print(f"Error fetching balance: {e}")
+            logger.error(f"Error fetching balance: {e}")
             return 0.0
     
     def place_order(self, ticker: str, side: str, quantity: int, 
@@ -279,15 +323,15 @@ class KalshiAPI:
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
             path = f"{path_prefix}/portfolio/orders"
             headers = self._signed_headers('POST', path)
-            response = self.session.post(endpoint, json=payload, headers=headers if headers else None)
+            response = self._request_with_retry('post', endpoint, json=payload, headers=headers if headers else None)
             
-            if response.status_code == 201:
+            if response and response.status_code == 201:
                 return response.json().get('order')
             else:
-                print(f"Order failed: {response.status_code} - {response.text}")
+                logger.error(f"Order failed: {response.status_code if response else 'No response'} - {response.text if response else ''}")
                 return None
         except Exception as e:
-            print(f"Error placing order: {e}")
+            logger.error(f"Error placing order: {e}")
             return None
 
     def cancel_order(self, order_id: str) -> bool:
@@ -297,14 +341,14 @@ class KalshiAPI:
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
             path = f"{path_prefix}/portfolio/orders/{order_id}"
             headers = self._signed_headers('DELETE', path)
-            response = self.session.delete(endpoint, headers=headers if headers else None)
-            if response.status_code in (200, 204):
+            response = self._request_with_retry('delete', endpoint, headers=headers if headers else None)
+            if response and response.status_code in (200, 204):
                 return True
             else:
-                print(f"Cancel order failed: {response.status_code} - {response.text}")
+                logger.error(f"Cancel order failed: {response.status_code if response else 'No response'} - {response.text if response else ''}")
                 return False
         except Exception as e:
-            print(f"Error cancelling order: {e}")
+            logger.error(f"Error cancelling order: {e}")
             return False
 
     def get_order(self, order_id: str) -> Optional[Dict]:
@@ -314,12 +358,12 @@ class KalshiAPI:
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
             path = f"{path_prefix}/portfolio/orders/{order_id}"
             headers = self._signed_headers('GET', path)
-            response = self.session.get(endpoint, headers=headers if headers else None)
-            if response.status_code == 200:
+            response = self._request_with_retry('get', endpoint, headers=headers if headers else None)
+            if response and response.status_code == 200:
                 return response.json().get('order')
             return None
         except Exception as e:
-            print(f"Error fetching order: {e}")
+            logger.error(f"Error fetching order: {e}")
             return None
 
     def get_positions(self) -> List[Dict]:
@@ -329,12 +373,12 @@ class KalshiAPI:
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
             path = f"{path_prefix}/portfolio/positions"
             headers = self._signed_headers('GET', path)
-            response = self.session.get(endpoint, headers=headers if headers else None)
-            if response.status_code == 200:
+            response = self._request_with_retry('get', endpoint, headers=headers if headers else None)
+            if response and response.status_code == 200:
                 return response.json().get('market_positions', [])
             return []
         except Exception as e:
-            print(f"Error fetching positions: {e}")
+            logger.error(f"Error fetching positions: {e}")
             return []
 
     def get_event(self, event_ticker: str) -> Optional[Dict]:
@@ -344,12 +388,12 @@ class KalshiAPI:
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
             path = f"{path_prefix}/events/{event_ticker}"
             headers = self._signed_headers('GET', path)
-            response = self.session.get(endpoint, headers=headers if headers else None)
-            if response.status_code == 200:
+            response = self._request_with_retry('get', endpoint, headers=headers if headers else None)
+            if response and response.status_code == 200:
                 return response.json().get('event')
             return None
         except Exception as e:
-            print(f"Error fetching event {event_ticker}: {e}")
+            logger.error(f"Error fetching event {event_ticker}: {e}")
             return None
 
 
@@ -360,6 +404,7 @@ class KalshiArbitrageBot:
         self.api = api
         self.min_profit_percent = min_profit_percent
         self.opportunities_found = []
+        self.storage = Storage()
     
     def analyze_market_mispricing(self, market: Dict, orderbook: Dict) -> Optional[Dict]:
         """Detect mispricing in a single market with depth/liquidity checks."""
@@ -409,15 +454,15 @@ class KalshiArbitrageBot:
             return None
 
         except Exception as e:
-            print(f"Error analyzing market: {e}")
+            logger.error(f"Error analyzing market: {e}")
             return None
     
     def scan_all_markets(self, category_filter: Optional[str] = None) -> List[Dict]:
         """Scan all markets for arbitrage opportunities"""
-        print(f"🔍 Scanning Kalshi markets...")
+        logger.info(f"🔍 Scanning Kalshi markets...")
         
         markets = self.api.get_markets(status="open")
-        print(f"Found {len(markets)} open markets")
+        logger.info(f"Found {len(markets)} open markets")
         
         opportunities = []
         scanned = 0
@@ -431,7 +476,7 @@ class KalshiArbitrageBot:
                     continue
                 
                 scanned += 1
-                print(f"Scanning {scanned}: {ticker} - {title[:50]}...")
+                logger.info(f"Scanning {scanned}: {ticker} - {title[:50]}...")
                 
                 orderbook = self.api.get_orderbook(ticker)
                 
@@ -442,13 +487,14 @@ class KalshiArbitrageBot:
                 
                 if opportunity:
                     opportunities.append(opportunity)
-                    print(f"  ✅ OPPORTUNITY FOUND!")
-                    print(f"     Profit: {opportunity['profit_cents']} cents ({opportunity['profit_percent']:.2f}%)")
+                    self.storage.log_opportunity(opportunity)
+                    logger.info(f"  ✅ OPPORTUNITY FOUND!")
+                    logger.info(f"     Profit: {opportunity['profit_cents']} cents ({opportunity['profit_percent']:.2f}%)")
                 
                 time.sleep(Config.RATE_LIMIT_DELAY)
                 
             except Exception as e:
-                print(f"  Error scanning {ticker}: {e}")
+                logger.error(f"  Error scanning {ticker}: {e}")
                 continue
         
         return opportunities
@@ -459,10 +505,10 @@ class KalshiArbitrageBot:
         Groups markets by event_ticker, checks if sum of best YES asks
         across all outcomes < 100 cents (guaranteed profit by buying all).
         """
-        print("🔍 Scanning for multi-leg arbitrage opportunities...")
+        logger.info("🔍 Scanning for multi-leg arbitrage opportunities...")
 
         markets = self.api.get_markets(status="open")
-        print(f"Found {len(markets)} open markets")
+        logger.info(f"Found {len(markets)} open markets")
 
         # Group by event_ticker
         events = {}
@@ -479,7 +525,7 @@ class KalshiArbitrageBot:
                 continue
 
             scanned_events += 1
-            print(f"Scanning event {scanned_events}: {event_ticker} ({len(event_markets)} markets)...")
+            logger.info(f"Scanning event {scanned_events}: {event_ticker} ({len(event_markets)} markets)...")
 
             total_cost = 0
             legs = []
@@ -528,24 +574,25 @@ class KalshiArbitrageBot:
                         'timestamp': datetime.now().isoformat()
                     }
                     opportunities.append(opp)
-                    print(f"  ✅ MULTI-LEG OPPORTUNITY! {len(legs)} legs, profit {profit}¢ ({profit_pct:.2f}%)")
+                    self.storage.log_opportunity(opp)
+                    logger.info(f"  ✅ MULTI-LEG OPPORTUNITY! {len(legs)} legs, profit {profit}¢ ({profit_pct:.2f}%)")
 
-        print(f"\nScanned {scanned_events} multi-market events")
+        logger.info(f"\nScanned {scanned_events} multi-market events")
         return opportunities
     
     def monitor_specific_markets(self, tickers: List[str], interval: int = 60):
         """Monitor specific markets continuously"""
-        print(f"👀 Monitoring {len(tickers)} markets every {interval}s")
-        print(f"Markets: {', '.join(tickers)}")
+        logger.info(f"👀 Monitoring {len(tickers)} markets every {interval}s")
+        logger.info(f"Markets: {', '.join(tickers)}")
         
         iteration = 0
         
         try:
             while True:
                 iteration += 1
-                print(f"\n{'='*60}")
-                print(f"Iteration {iteration} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                print(f"{'='*60}")
+                logger.info(f"\n{'='*60}")
+                logger.info(f"Iteration {iteration} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                logger.info(f"{'='*60}")
                 
                 for ticker in tickers:
                     try:
@@ -557,32 +604,32 @@ class KalshiArbitrageBot:
                         opportunity = self.analyze_market_mispricing(market, orderbook)
                         
                         if opportunity:
-                            print(f"\n🎯 ARBITRAGE OPPORTUNITY!")
-                            print(f"Market: {opportunity['title']}")
-                            print(f"YES price: {opportunity['yes_price']} cents")
-                            print(f"NO price: {opportunity['no_price']} cents")
-                            print(f"Total cost: {opportunity['total_cost']} cents")
-                            print(f"Profit: {opportunity['profit_cents']} cents ({opportunity['profit_percent']:.2f}%)")
-                            print(f"Strategy: {opportunity['strategy']}")
+                            logger.info(f"\n🎯 ARBITRAGE OPPORTUNITY!")
+                            logger.info(f"Market: {opportunity['title']}")
+                            logger.info(f"YES price: {opportunity['yes_price']} cents")
+                            logger.info(f"NO price: {opportunity['no_price']} cents")
+                            logger.info(f"Total cost: {opportunity['total_cost']} cents")
+                            logger.info(f"Profit: {opportunity['profit_cents']} cents ({opportunity['profit_percent']:.2f}%)")
+                            logger.info(f"Strategy: {opportunity['strategy']}")
                              
                             self.opportunities_found.append(opportunity)
                         else:
-                            print(f"✓ {ticker}: No opportunity (spread too small)")
+                            logger.info(f"✓ {ticker}: No opportunity (spread too small)")
                         
                         time.sleep(Config.RATE_LIMIT_DELAY)
                         
                     except Exception as e:
-                        print(f"Error monitoring {ticker}: {e}")
+                        logger.error(f"Error monitoring {ticker}: {e}")
                 
-                print(f"\nWaiting {interval}s until next scan...")
-                print(f"Total opportunities found: {len(self.opportunities_found)}")
+                logger.info(f"\nWaiting {interval}s until next scan...")
+                logger.info(f"Total opportunities found: {len(self.opportunities_found)}")
                 time.sleep(interval)
                 
         except KeyboardInterrupt:
-            print(f"\n\n{'='*60}")
-            print(f"Monitoring stopped by user")
-            print(f"Total opportunities found: {len(self.opportunities_found)}")
-            print(f"{'='*60}")
+            logger.info(f"\n\n{'='*60}")
+            logger.info(f"Monitoring stopped by user")
+            logger.info(f"Total opportunities found: {len(self.opportunities_found)}")
+            logger.info(f"{'='*60}")
 
 
 class KalshiTradingBot:
@@ -596,6 +643,7 @@ class KalshiTradingBot:
         self.initial_balance = initial_balance
         self.positions = []
         self.trade_history = []
+        self.storage = Storage()
     
     def execute_arbitrage(self, opportunity: Dict, quantity: int = 1):
         """Execute arbitrage trade (buy both YES and NO)""" 
@@ -605,23 +653,23 @@ class KalshiTradingBot:
         no_price = opportunity['no_price']
         total_cost = (yes_price + no_price) * quantity / 100
         
-        print(f"\n{'='*60}")
-        print(f"🤖 EXECUTING ARBITRAGE")
-        print(f"{'='*60}")
-        print(f"Market: {opportunity['title']}")
-        print(f"Quantity: {quantity} contracts")
-        print(f"YES price: ${yes_price/100:.2f} x {quantity} = ${yes_price * quantity / 100:.2f}")
-        print(f"NO price: ${no_price/100:.2f} x {quantity} = ${no_price * quantity / 100:.2f}")
-        print(f"Total cost: ${total_cost:.2f}")
-        print(f"Expected payout: ${quantity:.2f}")
-        print(f"Expected profit: ${quantity - total_cost:.2f}")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"🤖 EXECUTING ARBITRAGE")
+        logger.info(f"{'='*60}")
+        logger.info(f"Market: {opportunity['title']}")
+        logger.info(f"Quantity: {quantity} contracts")
+        logger.info(f"YES price: ${yes_price/100:.2f} x {quantity} = ${yes_price * quantity / 100:.2f}")
+        logger.info(f"NO price: ${no_price/100:.2f} x {quantity} = ${no_price * quantity / 100:.2f}")
+        logger.info(f"Total cost: ${total_cost:.2f}")
+        logger.info(f"Expected payout: ${quantity:.2f}")
+        logger.info(f"Expected profit: ${quantity - total_cost:.2f}")
         
         if total_cost > self.balance:
-            print(f"❌ Insufficient balance (need ${total_cost:.2f}, have ${self.balance:.2f})")
+            logger.error(f"❌ Insufficient balance (need ${total_cost:.2f}, have ${self.balance:.2f})")
             return False
 
         if self.paper_trading:
-            print(f"\n📄 PAPER TRADE MODE - No real orders placed")
+            logger.info(f"\n📄 PAPER TRADE MODE - No real orders placed")
 
             trade = {
                 'ticker': ticker,
@@ -631,60 +679,62 @@ class KalshiTradingBot:
                 'no_price': no_price,
                 'cost': total_cost,
                 'expected_profit': quantity - total_cost,
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.now().isoformat(),
+                'paper_trade': True
             }
 
             self.trade_history.append(trade)
             self.balance -= total_cost
             self.positions.append(trade)
+            self.storage.log_trade(trade)
 
-            print(f"✅ Paper trade recorded")
-            print(f"Remaining balance: ${self.balance:.2f}")
+            logger.info(f"✅ Paper trade recorded")
+            logger.info(f"Remaining balance: ${self.balance:.2f}")
 
         else:
             # Live trading path with safeguards
             if not Config.LIVE_TRADING_ENABLED:
-                print("\n⚠️  LIVE TRADING DISABLED - enable by setting ENABLE_LIVE_TRADING=true in .env")
+                logger.warning("\n⚠️  LIVE TRADING DISABLED - enable by setting ENABLE_LIVE_TRADING=true in .env")
                 return False
 
             if total_cost > Config.MAX_TRADE_USD:
-                print(f"\n⚠️  Trade exceeds configured max (${Config.MAX_TRADE_USD:.2f}). Refusing to place live orders.")
+                logger.warning(f"\n⚠️  Trade exceeds configured max (${Config.MAX_TRADE_USD:.2f}). Refusing to place live orders.")
                 return False
 
-            print(f"\n⚠️  LIVE TRADING MODE - About to place real orders (SAFE MODE)")
-            print(f"Market: {opportunity['title']}")
-            print(f"YES price: ${yes_price/100:.2f} x {quantity}")
-            print(f"NO price: ${no_price/100:.2f} x {quantity}")
-            print(f"Total cost: ${total_cost:.2f}")
+            logger.warning(f"\n⚠️  LIVE TRADING MODE - About to place real orders (SAFE MODE)")
+            logger.warning(f"Market: {opportunity['title']}")
+            logger.warning(f"YES price: ${yes_price/100:.2f} x {quantity}")
+            logger.warning(f"NO price: ${no_price/100:.2f} x {quantity}")
+            logger.warning(f"Total cost: ${total_cost:.2f}")
 
             confirmation = input("Type 'YES' to confirm and place live orders: ").strip().upper()
             if confirmation != 'YES':
-                print("Aborted by user. No orders placed.")
+                logger.info("Aborted by user. No orders placed.")
                 return False
 
-            print("Placing YES order...")
+            logger.info("Placing YES order...")
             yes_order = self.api.place_order(ticker, 'yes', quantity, yes_price, order_type='limit')
 
             if not yes_order:
-                print("❌ YES order failed. No orders placed.")
+                logger.error("❌ YES order failed. No orders placed.")
                 return False
 
-            print("Placing NO order...")
+            logger.info("Placing NO order...")
             no_order = self.api.place_order(ticker, 'no', quantity, no_price, order_type='limit')
 
             if not no_order:
                 # YES succeeded but NO failed — cancel YES to avoid naked exposure
                 yes_order_id = yes_order.get('order_id')
-                print(f"❌ NO order failed! Cancelling YES order {yes_order_id} to prevent naked exposure...")
+                logger.error(f"❌ NO order failed! Cancelling YES order {yes_order_id} to prevent naked exposure...")
                 if self.api.cancel_order(yes_order_id):
-                    print("✅ YES order cancelled successfully. No exposure.")
+                    logger.info("✅ YES order cancelled successfully. No exposure.")
                 else:
-                    print("⚠️  CRITICAL: Failed to cancel YES order! Manual intervention required!")
-                    print(f"   Order ID: {yes_order_id} | Ticker: {ticker}")
+                    logger.error("⚠️  CRITICAL: Failed to cancel YES order! Manual intervention required!")
+                    logger.error(f"   Order ID: {yes_order_id} | Ticker: {ticker}")
                 return False
 
             # Both orders succeeded
-            print("✅ Both orders placed successfully")
+            logger.info("✅ Both orders placed successfully")
             trade = {
                 'ticker': ticker,
                 'type': 'arbitrage',
@@ -695,12 +745,14 @@ class KalshiTradingBot:
                 'expected_profit': quantity - total_cost,
                 'timestamp': datetime.now().isoformat(),
                 'yes_order': yes_order,
-                'no_order': no_order
+                'no_order': no_order,
+                'paper_trade': False
             }
             self.trade_history.append(trade)
             self.balance -= total_cost
             self.positions.append(trade)
-            print(f"Remaining balance: ${self.balance:.2f}")
+            self.storage.log_trade(trade)
+            logger.info(f"Remaining balance: ${self.balance:.2f}")
 
         return True
     
@@ -723,58 +775,59 @@ class KalshiTradingBot:
         """Print formatted statistics"""
         stats = self.get_stats()
         
-        print(f"\n{'='*60}")
-        print(f"📊 TRADING STATISTICS")
-        print(f"{'='*60}")
-        print(f"Mode: {'PAPER TRADING' if stats['paper_trading'] else 'LIVE TRADING'}")
-        print(f"Initial balance: ${stats['initial_balance']:.2f}")
-        print(f"Current balance: ${stats['current_balance']:.2f}")
-        print(f"Total invested: ${stats['total_invested']:.2f}")
-        print(f"Total trades: {stats['total_trades']}")
-        print(f"Open positions: {stats['open_positions']}")
-        print(f"Expected profit: ${stats['expected_profit']:.2f}")
-        print(f"Expected ROI: {stats['expected_roi_percent']:.2f}%")
-        print(f"{'='*60}")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"📊 TRADING STATISTICS")
+        logger.info(f"{'='*60}")
+        logger.info(f"Mode: {'PAPER TRADING' if stats['paper_trading'] else 'LIVE TRADING'}")
+        logger.info(f"Initial balance: ${stats['initial_balance']:.2f}")
+        logger.info(f"Current balance: ${stats['current_balance']:.2f}")
+        logger.info(f"Total invested: ${stats['total_invested']:.2f}")
+        logger.info(f"Total trades: {stats['total_trades']}")
+        logger.info(f"Open positions: {stats['open_positions']}")
+        logger.info(f"Expected profit: ${stats['expected_profit']:.2f}")
+        logger.info(f"Expected ROI: {stats['expected_roi_percent']:.2f}%")
+        logger.info(f"{'='*60}")
 
 
 def main():
     """Main function""" 
     
-    print(f"\n{'='*60}")
-    print(f"🤖 KALSHI ARBITRAGE BOT - Educational Version")
-    print(f"{'='*60}\n")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"🤖 KALSHI ARBITRAGE BOT - Educational Version")
+    logger.info(f"{'='*60}\n")
     
     # Load configuration from config.py/.env
     try:
         Config.validate()
     except Exception as e:
-        print(f"Configuration error: {e}")
+        logger.error(f"Configuration error: {e}")
 
     Config.print_config()
 
     api = KalshiAPI(email=Config.KALSHI_EMAIL, password=Config.KALSHI_PASSWORD, api_key=Config.KALSHI_API_KEY)
     bot = KalshiArbitrageBot(api, min_profit_percent=Config.MIN_PROFIT_PERCENT)
     
-    print("Choose mode:")
-    print("1. Scan all markets once")
-    print("2. Scan specific category (e.g., BTC, NASDAQ)")
-    print("3. Monitor specific tickers continuously")
-    print("4. Demo paper trading")
-    print("5. Scan multi-leg arbitrage across events")
+    logger.info("Choose mode:")
+    logger.info("1. Scan all markets once")
+    logger.info("2. Scan specific category (e.g., BTC, NASDAQ)")
+    logger.info("3. Monitor specific tickers continuously")
+    logger.info("4. Demo paper trading")
+    logger.info("5. Scan multi-leg arbitrage across events")
+    logger.info("6. View historical stats")
     
-    choice = input("\nEnter choice (1-5): ").strip()
+    choice = input("\nEnter choice (1-6): ").strip()
     
     if choice == "1":
         opportunities = bot.scan_all_markets()
-        print(f"\n✅ Scan complete: Found {len(opportunities)} opportunities")
+        logger.info(f"\n✅ Scan complete: Found {len(opportunities)} opportunities")
         
     elif choice == "2":
         category = input("Enter category keyword (BTC, NASDAQ, etc.): ").strip()
         opportunities = bot.scan_all_markets(category_filter=category)
-        print(f"\n✅ Scan complete: Found {len(opportunities)} opportunities")
+        logger.info(f"\n✅ Scan complete: Found {len(opportunities)} opportunities")
         
     elif choice == "3":
-        print("\nExample tickers: KXBTC-23DEC31-T50000, INX-23DEC-T4500")
+        logger.info("\nExample tickers: KXBTC-23DEC31-T50000, INX-23DEC-T4500")
         tickers_input = input("Enter tickers (comma-separated): ").strip()
         tickers = [t.strip() for t in tickers_input.split(",")]
         bot.monitor_specific_markets(tickers, interval=60)
@@ -797,15 +850,54 @@ def main():
 
     elif choice == "5":
         opportunities = bot.scan_multi_leg_arbitrage()
-        print(f"\n✅ Multi-leg scan complete: Found {len(opportunities)} opportunities")
+        logger.info(f"\n✅ Multi-leg scan complete: Found {len(opportunities)} opportunities")
         for i, opp in enumerate(opportunities, 1):
-            print(f"\n{i}. Event: {opp['event_ticker']}")
-            print(f"   Legs: {opp['num_legs']} | Cost: {opp['total_cost']}¢ | Profit: {opp['profit_cents']}¢ ({opp['profit_percent']:.2f}%)")
+            logger.info(f"\n{i}. Event: {opp['event_ticker']}")
+            logger.info(f"   Legs: {opp['num_legs']} | Cost: {opp['total_cost']}¢ | Profit: {opp['profit_cents']}¢ ({opp['profit_percent']:.2f}%)")
             for leg in opp['legs']:
-                print(f"     - {leg['ticker']}: YES @ {leg['yes_price']}¢ (qty: {leg['quantity_available']})")
+                logger.info(f"     - {leg['ticker']}: YES @ {leg['yes_price']}¢ (qty: {leg['quantity_available']})")
+
+    elif choice == "6":
+        storage = Storage()
+        logger.info(f"\n{'='*60}")
+        logger.info(f"📊 HISTORICAL STATISTICS")
+        logger.info(f"{'='*60}")
+        
+        # Opportunity stats
+        stats = storage.get_opportunity_stats()
+        logger.info(f"\n🎯 Opportunity Statistics:")
+        logger.info(f"  Total opportunities found: {stats.get('total', 0)}")
+        if stats.get('avg_profit'):
+            logger.info(f"  Average profit: {stats['avg_profit']:.2f}%")
+        if stats.get('max_profit'):
+            logger.info(f"  Max profit: {stats['max_profit']:.2f}%")
+        
+        # Recent opportunities
+        opportunities = storage.get_all_opportunities()
+        if opportunities:
+            logger.info(f"\n📈 Recent Opportunities (last 10):")
+            for i, opp in enumerate(opportunities[:10], 1):
+                opp_type = opp.get('type', 'single')
+                if opp_type == 'multi_leg':
+                    logger.info(f"  {i}. [{opp['detected_at'][:10]}] Multi-leg: {opp['event_ticker']} | Profit: {opp['profit_cents']}¢ ({opp['profit_percent']:.2f}%)")
+                else:
+                    logger.info(f"  {i}. [{opp['detected_at'][:10]}] {opp['ticker']}: {opp['title'][:40]} | Profit: {opp['profit_cents']}¢ ({opp['profit_percent']:.2f}%)")
+        
+        # Trade history
+        trades = storage.get_all_trades()
+        logger.info(f"\n💼 Trade History:")
+        logger.info(f"  Total trades executed: {len(trades)}")
+        if trades:
+            logger.info(f"\n  Recent Trades (last 10):")
+            for i, trade in enumerate(trades[:10], 1):
+                mode = "Paper" if trade['paper_trade'] else "Live"
+                logger.info(f"  {i}. [{trade['executed_at'][:10]}] {mode}: {trade['ticker']} | Qty: {trade['quantity']} | Cost: ${trade['cost_usd']:.2f} | Expected profit: ${trade['expected_profit_usd']:.2f}")
+        
+        storage.close()
+        logger.info(f"{'='*60}")
     
     else:
-        print("Invalid choice")
+        logger.error("Invalid choice")
 
 
 if __name__ == "__main__":
