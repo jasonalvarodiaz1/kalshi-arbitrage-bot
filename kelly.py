@@ -122,7 +122,10 @@ def size_position(
     # For binary markets: odds = (1 - price) / price
     # For arbitrage with known edge, we use a simplified approach
     if win_prob is None:
-        win_prob = 0.99  # Assume near-certain for arb
+        # Default win probability for arbitrage is 0.99 (99%)
+        # This assumes near-certain execution risk only (order fill, price slip)
+        # Not used for actual win/loss calculation since edge is known
+        win_prob = 0.99
     
     loss_prob = 1 - win_prob
     if loss_prob <= 0:
@@ -142,7 +145,11 @@ def size_position(
     
     # Apply duration factor — shorter markets get smaller positions
     if duration_minutes is not None and duration_minutes > 0:
-        # Scale: 15 min = 0.5x, 60 min = 0.8x, 240+ min = 1.0x
+        # Duration scaling formula: factor = 0.4 + (minutes / 400)
+        # This gives: 15 min → 0.4375 (~0.5x), 60 min → 0.55 (~0.8x via half-Kelly), 
+        #             240 min → 1.0x, 400+ min → 1.0x (capped)
+        # The 0.4 base ensures minimum 40% sizing for very short markets
+        # The 400 divisor provides gradual scaling up to ~7 hours
         duration_factor = min(1.0, 0.4 + (duration_minutes / 400))
         kelly_fraction_val *= duration_factor
     
