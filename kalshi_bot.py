@@ -1,5 +1,6 @@
 import requests
 import time
+import random
 import logging
 from typing import Dict, List, Optional
 from datetime import datetime, timezone
@@ -135,6 +136,88 @@ class KalshiAPI:
             'KALSHI-ACCESS-SIGNATURE': sig_b64
         }
     
+    def _request_with_retry(self, method: str, url: str, max_retries: int = 3, **kwargs) -> Optional[requests.Response]:
+        """Make HTTP request with exponential backoff retry on transient failures.
+        
+        Retries on:
+        - 429 Too Many Requests (rate limit)
+        - 500, 502, 503, 504 (server errors)
+        - ConnectionError, Timeout (network issues)
+        
+        Backoff schedule: 2s, 5s, 9s (base * 2^attempt + jitter)
+        
+        Args:
+            method: HTTP method ('GET', 'POST', 'DELETE', etc.)
+            url: Full URL
+            max_retries: Maximum retry attempts (default 3)
+            **kwargs: Passed to requests (json, params, headers, etc.)
+        
+        Returns:
+            Response object, or None if all retries exhausted
+        """
+        base_delay = 1.5
+        
+        for attempt in range(max_retries + 1):
+            try:
+                # Make the request
+                response = self.session.request(method, url, **kwargs)
+                
+                # Check for success
+                if response.status_code < 400:
+                    return response
+                
+                # Don't retry on client errors (400, 401, 403, 404)
+                if 400 <= response.status_code < 500 and response.status_code != 429:
+                    return response
+                
+                # Retry on 429 or 5xx
+                if response.status_code == 429 or response.status_code >= 500:
+                    if attempt < max_retries:
+                        # Check for Retry-After header
+                        retry_after = response.headers.get('Retry-After')
+                        if retry_after and retry_after.isdigit():
+                            delay = int(retry_after)
+                        else:
+                            delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
+                        
+                        logger.warning(
+                            "Request failed with %d: %s %s (attempt %d/%d). Retrying in %.2fs...",
+                            response.status_code, method, url, attempt + 1, max_retries + 1, delay
+                        )
+                        time.sleep(delay)
+                        continue
+                    else:
+                        logger.error(
+                            "Request failed after %d retries: %s %s (status: %d)",
+                            max_retries + 1, method, url, response.status_code
+                        )
+                        return response
+                
+                # Return for any other status code
+                return response
+                
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                if attempt < max_retries:
+                    delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
+                    logger.warning(
+                        "Network error: %s %s (attempt %d/%d). Retrying in %.2fs...",
+                        method, url, attempt + 1, max_retries + 1, delay
+                    )
+                    time.sleep(delay)
+                    continue
+                else:
+                    logger.error(
+                        "Request failed after %d retries: %s %s (error: %s)",
+                        max_retries + 1, method, url, str(e)
+                    )
+                    return None
+            except Exception as e:
+                # Don't retry on unexpected errors
+                logger.error("Unexpected error in request: %s %s - %s", method, url, str(e))
+                return None
+        
+        return None
+    
     def login(self) -> bool:
         """Authenticate with Kalshi"""
         try:
@@ -143,7 +226,12 @@ class KalshiAPI:
                 "email": self.email,
                 "password": self.password
             }
-            response = self.session.post(endpoint, json=payload)
+            response = self._request_with_retry('POST', endpoint, json=payload)
+            
+            if response is None:
+                logger.error("Login request failed after retries: POST %s", endpoint)
+                print("❌ Login error: Request failed after retries")
+                return False
             
             if response.status_code == 200:
                 data = response.json()
@@ -184,7 +272,11 @@ class KalshiAPI:
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
             path = f"{path_prefix}/markets"
             headers = self._signed_headers('GET', path)
-            response = self.session.get(endpoint, params=params, headers=headers if headers else None)
+            response = self._request_with_retry('GET', endpoint, params=params, headers=headers if headers else None)
+            
+            if response is None:
+                logger.error("Request failed after retries: GET %s", endpoint)
+                return [], None
             
             if response.status_code == 200:
                 data = response.json()
@@ -210,7 +302,7 @@ class KalshiAPI:
             all_markets.extend(markets)
             if not cursor or not markets:
                 break
-            time.sleep(0.2)  # Rate limit
+            time.sleep(Config.RATE_LIMIT_DELAY)  # Rate limit
         print(f"📦 Fetched {len(all_markets)} total markets ({page} pages)")
         return all_markets
 
@@ -222,7 +314,10 @@ class KalshiAPI:
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
             path = f"{path_prefix}/events/{event_ticker}"
             headers = self._signed_headers('GET', path)
-            response = self.session.get(endpoint, headers=headers if headers else None)
+            response = self._request_with_retry('GET', endpoint, headers=headers if headers else None)
+            if response is None:
+                logger.error("Request failed after retries: GET %s", endpoint)
+                return None
             if response.status_code == 200:
                 return response.json().get('event')
             return None
@@ -238,7 +333,11 @@ class KalshiAPI:
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
             path = f"{path_prefix}/markets/{ticker}"
             headers = self._signed_headers('GET', path)
-            response = self.session.get(endpoint, headers=headers if headers else None)
+            response = self._request_with_retry('GET', endpoint, headers=headers if headers else None)
+            
+            if response is None:
+                logger.error("Request failed after retries: GET %s", endpoint)
+                return None
             
             if response.status_code == 200:
                 return response.json().get('market')
@@ -260,7 +359,11 @@ class KalshiAPI:
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
             path = f"{path_prefix}/markets/{ticker}/orderbook"
             headers = self._signed_headers('GET', path)
-            response = self.session.get(endpoint, headers=headers if headers else None)
+            response = self._request_with_retry('GET', endpoint, headers=headers if headers else None)
+            
+            if response is None:
+                logger.error("Request failed after retries: GET %s", endpoint)
+                return {}
             
             if response.status_code == 200:
                 data = response.json()
@@ -287,7 +390,11 @@ class KalshiAPI:
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
             path = f"{path_prefix}/markets/{ticker}/trades"
             headers = self._signed_headers('GET', path)
-            response = self.session.get(endpoint, params=params, headers=headers if headers else None)
+            response = self._request_with_retry('GET', endpoint, params=params, headers=headers if headers else None)
+            
+            if response is None:
+                logger.error("Request failed after retries: GET %s", endpoint)
+                return []
             
             if response.status_code == 200:
                 return response.json().get('trades', [])
@@ -306,7 +413,11 @@ class KalshiAPI:
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
             path = f"{path_prefix}/portfolio/balance"
             headers = self._signed_headers('GET', path)
-            response = self.session.get(endpoint, headers=headers if headers else None)
+            response = self._request_with_retry('GET', endpoint, headers=headers if headers else None)
+            
+            if response is None:
+                logger.error("Request failed after retries: GET %s", endpoint)
+                return 0.0
             
             if response.status_code == 200:
                 data = response.json()
@@ -346,7 +457,11 @@ class KalshiAPI:
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
             path = f"{path_prefix}/portfolio/orders"
             headers = self._signed_headers('POST', path)
-            response = self.session.post(endpoint, json=payload, headers=headers if headers else None)
+            response = self._request_with_retry('POST', endpoint, json=payload, headers=headers if headers else None)
+            
+            if response is None:
+                logger.error("Request failed after retries: POST %s", endpoint)
+                return None
             
             if response.status_code == 201:
                 return response.json().get('order')
@@ -365,7 +480,11 @@ class KalshiAPI:
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
             path = f"{path_prefix}/portfolio/orders/{order_id}"
             headers = self._signed_headers('DELETE', path)
-            response = self.session.delete(endpoint, headers=headers if headers else None)
+            response = self._request_with_retry('DELETE', endpoint, headers=headers if headers else None)
+            
+            if response is None:
+                logger.error("Request failed after retries: DELETE %s", endpoint)
+                return False
             
             if response.status_code == 200:
                 return True
@@ -384,7 +503,11 @@ class KalshiAPI:
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
             path = f"{path_prefix}/portfolio/orders/{order_id}"
             headers = self._signed_headers('GET', path)
-            response = self.session.get(endpoint, headers=headers if headers else None)
+            response = self._request_with_retry('GET', endpoint, headers=headers if headers else None)
+            
+            if response is None:
+                logger.error("Request failed after retries: GET %s", endpoint)
+                return None
             
             if response.status_code == 200:
                 return response.json().get('order')
@@ -401,7 +524,11 @@ class KalshiAPI:
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
             path = f"{path_prefix}/portfolio/positions"
             headers = self._signed_headers('GET', path)
-            response = self.session.get(endpoint, headers=headers if headers else None)
+            response = self._request_with_retry('GET', endpoint, headers=headers if headers else None)
+            
+            if response is None:
+                logger.error("Request failed after retries: GET %s", endpoint)
+                return []
             
             if response.status_code == 200:
                 return response.json().get('positions', [])
@@ -582,7 +709,7 @@ class KalshiArbitrageBot:
                 if not self._check_expiry(market):
                     return None
 
-                time.sleep(0.15)  # Rate limit between orderbook calls
+                time.sleep(Config.RATE_LIMIT_DELAY)  # Rate limit between orderbook calls
 
             guaranteed_payout = 100  # Exactly one outcome pays $1
             profit = guaranteed_payout - total_cost
@@ -653,7 +780,7 @@ class KalshiArbitrageBot:
                     if self.storage:
                         self.storage.save_opportunity(opportunity)
                 
-                time.sleep(0.3)
+                time.sleep(Config.RATE_LIMIT_DELAY)
                 
             except Exception as e:
                 print(f"  Error scanning {ticker}: {e}")
@@ -845,7 +972,7 @@ class KalshiArbitrageBot:
                         else:
                             print(f"✓ {ticker}: No opportunity (spread too small)")
                         
-                        time.sleep(0.5)
+                        time.sleep(Config.RATE_LIMIT_DELAY)
                         
                     except Exception as e:
                         print(f"Error monitoring {ticker}: {e}")
@@ -984,39 +1111,57 @@ class KalshiTradingBot:
             print(f"Total cost: ${total_cost:.2f}")
             print(f"Expected profit: ${quantity - total_cost:.2f}")
             
-            print("\nPlacing YES order...")
+            # Place YES order first
+            logger.info("Placing YES order: %s qty=%d price=%d¢", ticker, quantity, yes_price)
             yes_order = self.api.place_order(ticker, 'yes', quantity, yes_price, order_type='limit')
-            print("Placing NO order...")
+
+            if not yes_order:
+                logger.error("YES order failed for %s. No orders placed.", ticker)
+                return False
+
+            yes_order_id = yes_order.get('order', {}).get('order_id') or yes_order.get('order_id')
+            if not yes_order_id:
+                logger.warning("YES order succeeded but order_id not found in response. Cannot cancel if NO order fails.")
+
+            # Place NO order
+            logger.info("Placing NO order: %s qty=%d price=%d¢", ticker, quantity, no_price)
             no_order = self.api.place_order(ticker, 'no', quantity, no_price, order_type='limit')
 
-            if yes_order and no_order:
-                print("✅ Both orders placed successfully (check exchange for order IDs)")
+            if not no_order:
+                # CRITICAL: YES succeeded but NO failed — cancel YES to prevent naked exposure
+                logger.critical("NO order failed for %s! Cancelling YES order %s to prevent naked exposure...", ticker, yes_order_id)
+                if yes_order_id and self.api.cancel_order(yes_order_id):
+                    logger.info("YES order %s cancelled successfully. No exposure.", yes_order_id)
+                else:
+                    logger.critical("FAILED to cancel YES order %s! MANUAL INTERVENTION REQUIRED. Check positions immediately.", yes_order_id)
+                return False
 
-                trade = {
-                    'ticker': ticker,
-                    'type': 'arbitrage',
-                    'quantity': quantity,
-                    'yes_price': yes_price,
-                    'no_price': no_price,
-                    'cost': total_cost,
-                    'expected_profit': quantity - total_cost,
-                    'timestamp': datetime.now().isoformat(),
-                    'yes_order': yes_order,
-                    'no_order': no_order,
-                    'paper_trading': False
-                }
+            logger.info("✅ Both orders placed successfully for %s", ticker)
+            print("✅ Both orders placed successfully (check exchange for order IDs)")
 
-                self.trade_history.append(trade)
-                self.balance -= total_cost
-                self.positions.append(trade)
-                print(f"Remaining balance: ${self.balance:.2f}")
-                self.notifier.notify_trade_executed(trade)
-                
-                # Save to storage if available
-                if self.storage:
-                    self.storage.save_trade(trade)
-            else:
-                print("❌ One or both orders failed. Check API responses and the exchange UI to reconcile." )
+            trade = {
+                'ticker': ticker,
+                'type': 'arbitrage',
+                'quantity': quantity,
+                'yes_price': yes_price,
+                'no_price': no_price,
+                'cost': total_cost,
+                'expected_profit': quantity - total_cost,
+                'timestamp': datetime.now().isoformat(),
+                'yes_order': yes_order,
+                'no_order': no_order,
+                'paper_trading': False
+            }
+
+            self.trade_history.append(trade)
+            self.balance -= total_cost
+            self.positions.append(trade)
+            print(f"Remaining balance: ${self.balance:.2f}")
+            self.notifier.notify_trade_executed(trade)
+            
+            # Save to storage if available
+            if self.storage:
+                self.storage.save_trade(trade)
 
         return True
     
@@ -1320,7 +1465,7 @@ def main():
                                             api.cancel_order(prev_order.get('order_id', ''))
                                         failed = True
                                         break
-                                    time.sleep(0.5)
+                                    time.sleep(Config.RATE_LIMIT_DELAY)
                                 
                                 if not failed:
                                     trade = {
@@ -1344,7 +1489,7 @@ def main():
                             else:
                                 print(f"   ⚠️ Trade not executed (safety limits)")
                         
-                        time.sleep(0.5)
+                        time.sleep(Config.RATE_LIMIT_DELAY)
                 else:
                     print(f"\n📊 No arbitrage opportunities found this scan")
                 
@@ -1521,7 +1666,7 @@ def main():
                             else:
                                 print(f"   ❌ Order failed")
                         
-                        time.sleep(0.5)
+                        time.sleep(Config.RATE_LIMIT_DELAY)
                 else:
                     print(f"\n📊 No probability opportunities found this scan")
                 
