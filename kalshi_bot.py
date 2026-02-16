@@ -5,24 +5,124 @@ import hashlib
 from typing import Dict, List, Optional
 from datetime import datetime
 import json
+from config import Config
+from urllib.parse import urlparse
+import base64
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+from cryptography.hazmat.backends import default_backend
+import base64
+import jwt
+import time as _time
+from datetime import timezone
 
 class KalshiAPI:
     """Wrapper for Kalshi Exchange API"""
     
-    BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
+    PROD_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"  # Updated Feb 2026
+    PROD_BASE_URL_OLD = "https://trading-api.kalshi.com/trade-api/v2"  # Deprecated
+    DEMO_BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
     
-    def __init__(self, email: Optional[str] = None, password: Optional[str] = None):
+    def __init__(self, email: Optional[str] = None, password: Optional[str] = None, api_key: Optional[str] = None):
         self.email = email
         self.password = password
+        self.api_key = api_key  # This is the KEY ID (UUID), not a bearer token
         self.token = None
+        self.private_key = None  # Loaded RSA key object
+        self.salt_length = asym_padding.PSS.DIGEST_LENGTH  # Will try MAX_LENGTH as fallback
+        self.BASE_URL = self.PROD_BASE_URL
         self.session = requests.Session()
         self.session.headers.update({
             'Content-Type': 'application/json',
             'Accept': 'application/json'
         })
-        
-        if email and password:
+
+        # Load private key from file if available
+        pk_pem = Config.load_private_key()
+        if pk_pem:
+            try:
+                self.private_key = serialization.load_pem_private_key(
+                    pk_pem.encode('utf-8'),
+                    password=None,
+                    backend=default_backend()
+                )
+                print("✅ Private key loaded from file")
+            except Exception as e:
+                print(f"❌ Failed to load private key: {e}")
+
+        # Determine auth method
+        if self.api_key and self.private_key:
+            # Use Kalshi signed-header auth (per docs)
+            # Test which base URL + salt length works
+            if self._test_auth():
+                print(f"✅ Authenticated with signed headers (base: {self.BASE_URL})")
+            else:
+                print("⚠️  Signed-header auth failed on both prod and demo URLs with both salt lengths")
+        elif email and password:
             self.login()
+
+    def _test_auth(self) -> bool:
+        """Try prod/demo URLs and both salt lengths to find working auth config."""
+        urls = [self.PROD_BASE_URL, self.PROD_BASE_URL_OLD, self.DEMO_BASE_URL]
+        salts = [asym_padding.PSS.DIGEST_LENGTH, asym_padding.PSS.MAX_LENGTH]
+
+        for base_url in urls:
+            for salt in salts:
+                self.BASE_URL = base_url
+                self.salt_length = salt
+                salt_name = 'DIGEST_LENGTH' if salt == asym_padding.PSS.DIGEST_LENGTH else 'MAX_LENGTH'
+                print(f"  Trying: {base_url} with salt={salt_name}...")
+
+                path = urlparse(base_url).path.rstrip('/') + '/markets'
+                headers = self._signed_headers('GET', path)
+                if not headers:
+                    print(f"    Skipped (no headers generated)")
+                    continue
+
+                try:
+                    resp = self.session.get(f"{base_url}/markets", params={'limit': 1}, headers=headers)
+                    print(f"    Response: {resp.status_code}")
+                    if resp.status_code == 200:
+                        return True
+                    else:
+                        # Show response body for debugging
+                        body = resp.text[:200] if resp.text else '(empty)'
+                        print(f"    Body: {body}")
+                except Exception as e:
+                    print(f"    Error: {e}")
+
+        return False
+
+    def _signed_headers(self, method: str, path: str) -> Dict[str, str]:
+        """Generate Kalshi signed headers using RSA-PSS per docs.
+
+        Args:
+            method: HTTP method (GET/POST)
+            path: request path without query (e.g., '/trade-api/v2/markets')
+        """
+        if not self.private_key or not self.api_key:
+            return {}
+
+        timestamp = str(int(time.time() * 1000))
+        msg_string = timestamp + method + path
+        msg = msg_string.encode('utf-8')
+
+        signature = self.private_key.sign(
+            msg,
+            asym_padding.PSS(
+                mgf=asym_padding.MGF1(hashes.SHA256()),
+                salt_length=self.salt_length
+            ),
+            hashes.SHA256()
+        )
+
+        sig_b64 = base64.b64encode(signature).decode('ascii')
+
+        return {
+            'KALSHI-ACCESS-KEY': self.api_key,
+            'KALSHI-ACCESS-TIMESTAMP': timestamp,
+            'KALSHI-ACCESS-SIGNATURE': sig_b64
+        }
     
     def login(self) -> bool:
         """Authenticate with Kalshi"""
@@ -57,13 +157,20 @@ class KalshiAPI:
                 'status': status,
                 'limit': limit
             }
-            response = self.session.get(endpoint, params=params)
+            # construct path without query for signing
+            path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
+            path = f"{path_prefix}/markets"
+            headers = self._signed_headers('GET', path)
+            response = self.session.get(endpoint, params=params, headers=headers if headers else None)
             
             if response.status_code == 200:
                 data = response.json()
                 return data.get('markets', [])
             else:
                 print(f"Error fetching markets: {response.status_code}")
+                if response.status_code == 401:
+                    body = response.text[:200] if response.text else '(empty)'
+                    print(f"  Response body: {body}")
                 return []
         except Exception as e:
             print(f"Error: {e}")
@@ -73,7 +180,10 @@ class KalshiAPI:
         """Get specific market by ticker"""
         try:
             endpoint = f"{self.BASE_URL}/markets/{ticker}"
-            response = self.session.get(endpoint)
+            path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
+            path = f"{path_prefix}/markets/{ticker}"
+            headers = self._signed_headers('GET', path)
+            response = self.session.get(endpoint, headers=headers if headers else None)
             
             if response.status_code == 200:
                 return response.json().get('market')
@@ -86,7 +196,10 @@ class KalshiAPI:
         """Get orderbook for a market"""
         try:
             endpoint = f"{self.BASE_URL}/markets/{ticker}/orderbook"
-            response = self.session.get(endpoint)
+            path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
+            path = f"{path_prefix}/markets/{ticker}/orderbook"
+            headers = self._signed_headers('GET', path)
+            response = self.session.get(endpoint, headers=headers if headers else None)
             
             if response.status_code == 200:
                 data = response.json()
@@ -107,7 +220,10 @@ class KalshiAPI:
         try:
             endpoint = f"{self.BASE_URL}/markets/{ticker}/trades"
             params = {'limit': limit}
-            response = self.session.get(endpoint, params=params)
+            path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
+            path = f"{path_prefix}/markets/{ticker}/trades"
+            headers = self._signed_headers('GET', path)
+            response = self.session.get(endpoint, params=params, headers=headers if headers else None)
             
             if response.status_code == 200:
                 return response.json().get('trades', [])
@@ -115,12 +231,17 @@ class KalshiAPI:
         except Exception as e:
             print(f"Error fetching trades: {e}")
             return []
+
+    # try_private_key_auth removed — replaced by _test_auth() + _signed_headers()
     
     def get_balance(self) -> float:
         """Get account balance (requires authentication)"""
         try:
             endpoint = f"{self.BASE_URL}/portfolio/balance"
-            response = self.session.get(endpoint)
+            path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
+            path = f"{path_prefix}/portfolio/balance"
+            headers = self._signed_headers('GET', path)
+            response = self.session.get(endpoint, headers=headers if headers else None)
             
             if response.status_code == 200:
                 data = response.json()
@@ -156,7 +277,10 @@ class KalshiAPI:
             
             payload = {k: v for k, v in payload.items() if v is not None}
             
-            response = self.session.post(endpoint, json=payload)
+            path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
+            path = f"{path_prefix}/portfolio/orders"
+            headers = self._signed_headers('POST', path)
+            response = self.session.post(endpoint, json=payload, headers=headers if headers else None)
             
             if response.status_code == 201:
                 return response.json().get('order')
@@ -343,10 +467,10 @@ class KalshiTradingBot:
         if total_cost > self.balance:
             print(f"❌ Insufficient balance (need ${total_cost:.2f}, have ${self.balance:.2f})")
             return False
-        
+
         if self.paper_trading:
             print(f"\n📄 PAPER TRADE MODE - No real orders placed")
-            
+
             trade = {
                 'ticker': ticker,
                 'type': 'arbitrage',
@@ -357,19 +481,63 @@ class KalshiTradingBot:
                 'expected_profit': quantity - total_cost,
                 'timestamp': datetime.now().isoformat()
             }
-            
+
             self.trade_history.append(trade)
             self.balance -= total_cost
             self.positions.append(trade)
-            
+
             print(f"✅ Paper trade recorded")
             print(f"Remaining balance: ${self.balance:.2f}")
-            
+
         else:
-            print(f"\n⚠️  LIVE TRADING MODE - Placing real orders!")
-            print(f"❌ Live trading not implemented (safety feature)")
-            print(f"Uncomment code and add proper error handling to enable")
-        
+            # Live trading path with safeguards
+            if not Config.LIVE_TRADING_ENABLED:
+                print("\n⚠️  LIVE TRADING DISABLED - enable by setting ENABLE_LIVE_TRADING=true in .env")
+                return False
+
+            if total_cost > Config.MAX_TRADE_USD:
+                print(f"\n⚠️  Trade exceeds configured max (${Config.MAX_TRADE_USD:.2f}). Refusing to place live orders.")
+                return False
+
+            print(f"\n⚠️  LIVE TRADING MODE - About to place real orders (SAFE MODE)")
+            print(f"Market: {opportunity['title']}")
+            print(f"YES price: ${yes_price/100:.2f} x {quantity}")
+            print(f"NO price: ${no_price/100:.2f} x {quantity}")
+            print(f"Total cost: ${total_cost:.2f}")
+
+            confirmation = input("Type 'YES' to confirm and place live orders: ").strip().upper()
+            if confirmation != 'YES':
+                print("Aborted by user. No orders placed.")
+                return False
+
+            print("Placing YES order...")
+            yes_order = self.api.place_order(ticker, 'yes', quantity, yes_price, order_type='limit')
+            print("Placing NO order...")
+            no_order = self.api.place_order(ticker, 'no', quantity, no_price, order_type='limit')
+
+            if yes_order and no_order:
+                print("✅ Both orders placed successfully (check exchange for order IDs)")
+
+                trade = {
+                    'ticker': ticker,
+                    'type': 'arbitrage',
+                    'quantity': quantity,
+                    'yes_price': yes_price,
+                    'no_price': no_price,
+                    'cost': total_cost,
+                    'expected_profit': quantity - total_cost,
+                    'timestamp': datetime.now().isoformat(),
+                    'yes_order': yes_order,
+                    'no_order': no_order
+                }
+
+                self.trade_history.append(trade)
+                self.balance -= total_cost
+                self.positions.append(trade)
+                print(f"Remaining balance: ${self.balance:.2f}")
+            else:
+                print("❌ One or both orders failed. Check API responses and the exchange UI to reconcile." )
+
         return True
     
     def get_stats(self) -> Dict:
@@ -412,8 +580,16 @@ def main():
     print(f"🤖 KALSHI ARBITRAGE BOT - Educational Version")
     print(f"{'='*60}\n")
     
-    api = KalshiAPI()
-    bot = KalshiArbitrageBot(api, min_profit_percent=1.0)
+    # Load configuration from config.py/.env
+    try:
+        Config.validate()
+    except Exception as e:
+        print(f"Configuration error: {e}")
+
+    Config.print_config()
+
+    api = KalshiAPI(email=Config.KALSHI_EMAIL, password=Config.KALSHI_PASSWORD, api_key=Config.KALSHI_API_KEY)
+    bot = KalshiArbitrageBot(api, min_profit_percent=Config.MIN_PROFIT_PERCENT)
     
     print("Choose mode:")
     print("1. Scan all markets once")
