@@ -257,7 +257,7 @@ class KalshiAPI:
                 print("🔄 Token expiring soon, refreshing...")
                 self.login()
     
-    def get_markets(self, status: str = "open", limit: int = 100, cursor: str = None) -> List[Dict]:
+    def get_markets(self, status: str = "open", limit: int = 100, cursor: str = None, series_ticker: str = None) -> List[Dict]:
         """Fetch active markets (single page)"""
         self._ensure_auth()
         try:
@@ -268,6 +268,8 @@ class KalshiAPI:
             }
             if cursor:
                 params['cursor'] = cursor
+            if series_ticker:
+                params['series_ticker'] = series_ticker
             # construct path without query for signing
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
             path = f"{path_prefix}/markets"
@@ -291,19 +293,22 @@ class KalshiAPI:
             print(f"Error: {e}")
             return [], None
 
-    def get_all_markets(self, status: str = "open") -> List[Dict]:
+    def get_all_markets(self, status: str = "open", series_ticker: str = None) -> List[Dict]:
         """Fetch ALL markets using pagination."""
         all_markets = []
         cursor = None
         page = 0
         while True:
             page += 1
-            markets, cursor = self.get_markets(status=status, limit=200, cursor=cursor)
+            markets, cursor = self.get_markets(status=status, limit=200, cursor=cursor, series_ticker=series_ticker)
             all_markets.extend(markets)
             if not cursor or not markets:
                 break
             time.sleep(Config.RATE_LIMIT_DELAY)  # Rate limit
-        print(f"📦 Fetched {len(all_markets)} total markets ({page} pages)")
+        if series_ticker:
+            print(f"📦 Fetched {len(all_markets)} {series_ticker} markets ({page} pages)")
+        else:
+            print(f"📦 Fetched {len(all_markets)} total markets ({page} pages)")
         return all_markets
 
     def get_event(self, event_ticker: str) -> Optional[Dict]:

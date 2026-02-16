@@ -360,13 +360,14 @@ class ProbabilityTrader:
         """
         logger.info("Scanning crypto markets for probability edge...")
         
-        # Fetch all open markets
-        markets = self.api.get_all_markets(status="open")
+        # Fetch crypto markets directly using series_ticker filter
+        btc_markets = self.api.get_all_markets(status="open", series_ticker="KXBTC")
+        eth_markets = self.api.get_all_markets(status="open", series_ticker="KXETH")
         
-        # Filter to crypto markets (KXBTC, KXETH)
-        crypto_markets = [m for m in markets if m.get('ticker', '').startswith(('KXBTC', 'KXETH'))]
+        crypto_markets = btc_markets + eth_markets
         
-        logger.info("Found %d crypto markets to scan", len(crypto_markets))
+        logger.info("Found %d crypto markets to scan (%d BTC + %d ETH)", 
+                   len(crypto_markets), len(btc_markets), len(eth_markets))
         
         opportunities = []
         
@@ -403,29 +404,88 @@ class ProbabilityTrader:
             interval_seconds: Seconds between scan cycles
         """
         logger.info("Starting auto-trade loop for probability strategy (interval=%ds)", interval_seconds)
+        logger.info("Paper trading: %s | Live trading: %s", self.config.PAPER_TRADING, self.config.LIVE_TRADING_ENABLED)
         
         iteration = 0
+        total_trades_attempted = 0
+        total_trades_succeeded = 0
         
         try:
             while True:
                 iteration += 1
+                logger.info("=" * 60)
                 logger.info("Scan iteration %d", iteration)
+                
+                # Get current balance for Kelly sizing
+                try:
+                    balance = self.api.get_balance()
+                    logger.info("Current balance: $%.2f", balance)
+                except Exception as e:
+                    logger.warning("Could not fetch balance: %s (using $250 default)", e)
+                    balance = 250.0
                 
                 opportunities = self.scan_crypto_markets()
                 
                 if opportunities:
                     logger.info("Found %d probability opportunities", len(opportunities))
-                    # Sort by edge
+                    # Sort by edge (best first)
                     opportunities.sort(key=lambda o: o.get('edge_percent', 0), reverse=True)
                     
                     for opp in opportunities:
-                        logger.info("Opportunity: %s - %s side at %d cents (%.2f%% edge)",
-                                   opp['ticker'], opp['side'], opp['price'], opp['edge_percent'])
+                        logger.info("")
+                        logger.info("📈 OPPORTUNITY: %s", opp['ticker'])
+                        logger.info("   Side: %s at %d¢", opp['side'].upper(), opp['contract_price'])
+                        logger.info("   Edge: %.2f%%", opp['edge_percent'])
+                        logger.info("   Est prob: %.1f%% | Implied prob: %.1f%%", 
+                                   opp['estimated_prob'] * 100,
+                                   opp['contract_price'])
+                        logger.info("   Kelly quantity: %d contracts ($%.2f)", 
+                                   opp['kelly_quantity'],
+                                   opp['kelly_quantity'] * opp['contract_price'] / 100)
+                        logger.info("   Time remaining: %.0f min", opp['minutes_remaining'])
+                        
+                        # Execute trade
+                        if opp['kelly_quantity'] > 0:
+                            total_trades_attempted += 1
+                            
+                            if self.config.PAPER_TRADING:
+                                logger.info("   🎯 PAPER TRADE: BUY %d contracts", opp['kelly_quantity'])
+                                logger.info("   📝 Simulated cost: $%.2f", 
+                                           opp['kelly_quantity'] * opp['contract_price'] / 100)
+                                total_trades_succeeded += 1
+                            else:
+                                # Real trade execution
+                                try:
+                                    logger.info("   💰 LIVE TRADE: Placing order...")
+                                    order = self.api.place_order(
+                                        ticker=opp['ticker'],
+                                        side=opp['side'],
+                                        quantity=opp['kelly_quantity'],
+                                        price=opp['contract_price']
+                                    )
+                                    
+                                    if order:
+                                        logger.info("   ✅ Order placed successfully: %s", order.get('order_id'))
+                                        total_trades_succeeded += 1
+                                    else:
+                                        logger.error("   ❌ Order failed")
+                                        
+                                except Exception as e:
+                                    logger.error("   ❌ Trade execution error: %s", e)
+                        else:
+                            logger.info("   ⏭️  Skipping (Kelly size = 0)")
                 else:
                     logger.info("No probability opportunities found this scan")
                 
+                logger.info("")
+                logger.info("Session stats: %d/%d trades succeeded", total_trades_succeeded, total_trades_attempted)
                 logger.info("Waiting %d seconds until next scan...", interval_seconds)
+                logger.info("=" * 60)
                 time.sleep(interval_seconds)
                 
         except KeyboardInterrupt:
-            logger.info("Auto-trade loop stopped by user")
+            logger.info("")
+            logger.info("🛑 Auto-trade loop stopped by user")
+            logger.info("Final stats: %d/%d trades succeeded over %d iterations", 
+                       total_trades_succeeded, total_trades_attempted, iteration)
+
