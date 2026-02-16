@@ -42,6 +42,13 @@ class Config:
     BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
     RATE_LIMIT_DELAY = 0.3  # Seconds between requests
     
+    # Probability Trading
+    MIN_EDGE_PERCENT = float(os.getenv('MIN_EDGE_PERCENT', 3.0))  # Minimum edge to trade
+    KELLY_MULTIPLIER = float(os.getenv('KELLY_MULTIPLIER', 0.5))  # Half-Kelly default (conservative)
+    BTC_15MIN_VOL = float(os.getenv('BTC_15MIN_VOL', 0.004))  # BTC 15-min realized vol (0.4%)
+    ETH_15MIN_VOL = float(os.getenv('ETH_15MIN_VOL', 0.005))  # ETH 15-min realized vol (0.5%)
+    PRICE_CACHE_SECONDS = int(os.getenv('PRICE_CACHE_SECONDS', 10))  # Price feed cache TTL
+    
     @classmethod
     def validate(cls):
         """Validate configuration"""
