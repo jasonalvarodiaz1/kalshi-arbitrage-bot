@@ -1,20 +1,13 @@
 import requests
 import time
-import hmac
-import hashlib
 from typing import Dict, List, Optional
 from datetime import datetime
-import json
 from config import Config
 from urllib.parse import urlparse
 import base64
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from cryptography.hazmat.backends import default_backend
-import base64
-import jwt
-import time as _time
-from datetime import timezone
 
 class KalshiAPI:
     """Wrapper for Kalshi Exchange API"""
@@ -316,7 +309,7 @@ class KalshiArbitrageBot:
             best_no_ask = min([ask[0] for ask in no_asks])
             
             total_cost = best_yes_ask + best_no_ask
-            guaranteed_payout = 100;
+            guaranteed_payout = 100
             
             profit = guaranteed_payout - total_cost
             profit_percent = (profit / total_cost) * 100

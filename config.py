@@ -15,6 +15,7 @@ class Config:
     
     # Bot Configuration
     MIN_PROFIT_PERCENT = float(os.getenv('MIN_PROFIT_PERCENT', 1.0))
+    MIN_ORDER_QUANTITY = int(os.getenv('MIN_ORDER_QUANTITY', 5))
     SCAN_INTERVAL_SECONDS = int(os.getenv('SCAN_INTERVAL_SECONDS', 60))
     PAPER_TRADING = os.getenv('PAPER_TRADING', 'true').lower() == 'true'
     # Live trading safety
