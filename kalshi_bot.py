@@ -413,11 +413,12 @@ class KalshiAPI:
 class KalshiArbitrageBot:
     """Arbitrage detection bot for Kalshi"""
     
-    def __init__(self, api: KalshiAPI, min_profit_percent: float = 2.0):
+    def __init__(self, api: KalshiAPI, min_profit_percent: float = 2.0, storage=None):
         self.api = api
         self.min_profit_percent = min_profit_percent
         self.opportunities_found = []
         self.notifier = NotificationManager()
+        self.storage = storage  # Optional storage backend
     
     def _check_expiry(self, market: Dict) -> bool:
         """Return True if market settles within the allowed time window.
@@ -646,6 +647,10 @@ class KalshiArbitrageBot:
                     print(f"  ✅ OPPORTUNITY FOUND!")
                     print(f"     Profit: {opportunity['profit_cents']} cents ({opportunity['profit_percent']:.2f}%)")
                     self.notifier.notify_opportunity(opportunity)
+                    
+                    # Save to storage if available
+                    if self.storage:
+                        self.storage.save_opportunity(opportunity)
                 
                 time.sleep(0.3)
                 
@@ -859,7 +864,7 @@ class KalshiTradingBot:
     """Paper trading bot for Kalshi (simulation mode)"""
     
     def __init__(self, api: KalshiAPI, initial_balance: float = 1000.0, 
-                 paper_trading: bool = True):
+                 paper_trading: bool = True, storage=None):
         self.api = api
         self.paper_trading = paper_trading
         self.balance = initial_balance
@@ -867,6 +872,7 @@ class KalshiTradingBot:
         self.positions = []
         self.trade_history = []
         self.notifier = NotificationManager()
+        self.storage = storage  # Optional storage backend
     
     def execute_arbitrage(self, opportunity: Dict, quantity: int = None, use_kelly: bool = False):
         """
@@ -929,7 +935,8 @@ class KalshiTradingBot:
                 'no_price': no_price,
                 'cost': total_cost,
                 'expected_profit': quantity - total_cost,
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.now().isoformat(),
+                'paper_trading': True
             }
 
             self.trade_history.append(trade)
@@ -939,6 +946,10 @@ class KalshiTradingBot:
             print(f"✅ Paper trade recorded")
             print(f"Remaining balance: ${self.balance:.2f}")
             self.notifier.notify_trade_executed(trade)
+            
+            # Save to storage if available
+            if self.storage:
+                self.storage.save_trade(trade)
 
         else:
             # Live trading path with safeguards
@@ -991,7 +1002,8 @@ class KalshiTradingBot:
                     'expected_profit': quantity - total_cost,
                     'timestamp': datetime.now().isoformat(),
                     'yes_order': yes_order,
-                    'no_order': no_order
+                    'no_order': no_order,
+                    'paper_trading': False
                 }
 
                 self.trade_history.append(trade)
@@ -999,6 +1011,10 @@ class KalshiTradingBot:
                 self.positions.append(trade)
                 print(f"Remaining balance: ${self.balance:.2f}")
                 self.notifier.notify_trade_executed(trade)
+                
+                # Save to storage if available
+                if self.storage:
+                    self.storage.save_trade(trade)
             else:
                 print("❌ One or both orders failed. Check API responses and the exchange UI to reconcile." )
 
@@ -1067,6 +1083,11 @@ class KalshiTradingBot:
             self.positions.remove(s)
             self.balance += s['quantity']  # Add payout back
             self.trade_history.append({**s, 'status': 'settled'})
+            
+            # Update storage if available
+            if self.storage:
+                # Save updated settled trade
+                self.storage.save_trade({**s, 'status': 'settled'})
 
         if settled:
             total_realized = sum(s.get('realized_profit', 0) for s in settled)
@@ -1139,7 +1160,18 @@ def main():
     Config.print_config()
 
     api = KalshiAPI(email=Config.KALSHI_EMAIL, password=Config.KALSHI_PASSWORD, api_key=Config.KALSHI_API_KEY)
-    bot = KalshiArbitrageBot(api, min_profit_percent=Config.MIN_PROFIT_PERCENT)
+    
+    # Initialize optional storage backend
+    storage = None
+    try:
+        from storage import Storage
+        storage = Storage("kalshi_bot.db")
+        logger.info("Storage enabled - trades and opportunities will be persisted")
+    except Exception as e:
+        logger.warning("Storage not available: %s", e)
+        print("⚠️  Note: Storage disabled - trades will not be persisted to database")
+    
+    bot = KalshiArbitrageBot(api, min_profit_percent=Config.MIN_PROFIT_PERCENT, storage=storage)
     
     print("Choose mode:")
     print("1. Scan all markets once (concurrent)")
@@ -1171,7 +1203,7 @@ def main():
         bot.monitor_specific_markets(tickers, interval=60)
         
     elif choice == "4":
-        trader = KalshiTradingBot(api, initial_balance=1000.0, paper_trading=True)
+        trader = KalshiTradingBot(api, initial_balance=1000.0, paper_trading=True, storage=storage)
         
         demo_opportunity = {
             'ticker': 'DEMO-TICKER',
@@ -1187,15 +1219,15 @@ def main():
         trader.print_stats()
     
     elif choice == "5":
-        trader = KalshiTradingBot(api, initial_balance=1000.0, paper_trading=True)
+        trader = KalshiTradingBot(api, initial_balance=1000.0, paper_trading=True, storage=storage)
         trader.print_stats()
     
     elif choice == "6":
-        trader = KalshiTradingBot(api, initial_balance=1000.0, paper_trading=True)
+        trader = KalshiTradingBot(api, initial_balance=1000.0, paper_trading=True, storage=storage)
         trader.reconcile_positions()
     
     elif choice == "7":
-        trader = KalshiTradingBot(api, initial_balance=1000.0, paper_trading=True)
+        trader = KalshiTradingBot(api, initial_balance=1000.0, paper_trading=True, storage=storage)
         trader.reconcile_with_exchange()
     
     elif choice == "8":
@@ -1216,7 +1248,8 @@ def main():
         trader = KalshiTradingBot(
             api, 
             initial_balance=starting_balance,
-            paper_trading=not Config.LIVE_TRADING_ENABLED
+            paper_trading=not Config.LIVE_TRADING_ENABLED,
+            storage=storage
         )
         
         iteration = 0
@@ -1388,7 +1421,8 @@ def main():
         trader = KalshiTradingBot(
             api,
             initial_balance=starting_balance,
-            paper_trading=not Config.LIVE_TRADING_ENABLED
+            paper_trading=not Config.LIVE_TRADING_ENABLED,
+            storage=storage
         )
         
         prob_trader = ProbabilityTrader(api, Config)
