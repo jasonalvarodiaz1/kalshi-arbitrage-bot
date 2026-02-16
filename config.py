@@ -32,6 +32,7 @@ class Config:
     
     # Filtering
     MIN_EXPIRY_MINUTES = int(os.getenv('MIN_EXPIRY_MINUTES', 30))
+    MAX_EXPIRY_HOURS = int(os.getenv('MAX_EXPIRY_HOURS', 24))  # Only trade markets settling within this window
     
     # Position Limits
     MAX_POSITIONS = int(os.getenv('MAX_POSITIONS', 10))

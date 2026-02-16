@@ -154,8 +154,8 @@ class KalshiAPI:
                 print("🔄 Token expiring soon, refreshing...")
                 self.login()
     
-    def get_markets(self, status: str = "open", limit: int = 100) -> List[Dict]:
-        """Fetch active markets"""
+    def get_markets(self, status: str = "open", limit: int = 100, cursor: str = None) -> List[Dict]:
+        """Fetch active markets (single page)"""
         self._ensure_auth()
         try:
             endpoint = f"{self.BASE_URL}/markets"
@@ -163,6 +163,8 @@ class KalshiAPI:
                 'status': status,
                 'limit': limit
             }
+            if cursor:
+                params['cursor'] = cursor
             # construct path without query for signing
             path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
             path = f"{path_prefix}/markets"
@@ -171,16 +173,47 @@ class KalshiAPI:
             
             if response.status_code == 200:
                 data = response.json()
-                return data.get('markets', [])
+                return data.get('markets', []), data.get('cursor', None)
             else:
                 print(f"Error fetching markets: {response.status_code}")
                 if response.status_code == 401:
                     body = response.text[:200] if response.text else '(empty)'
                     print(f"  Response body: {body}")
-                return []
+                return [], None
         except Exception as e:
             print(f"Error: {e}")
-            return []
+            return [], None
+
+    def get_all_markets(self, status: str = "open") -> List[Dict]:
+        """Fetch ALL markets using pagination."""
+        all_markets = []
+        cursor = None
+        page = 0
+        while True:
+            page += 1
+            markets, cursor = self.get_markets(status=status, limit=200, cursor=cursor)
+            all_markets.extend(markets)
+            if not cursor or not markets:
+                break
+            time.sleep(0.2)  # Rate limit
+        print(f"📦 Fetched {len(all_markets)} total markets ({page} pages)")
+        return all_markets
+
+    def get_event(self, event_ticker: str) -> Optional[Dict]:
+        """Get event details and its markets."""
+        self._ensure_auth()
+        try:
+            endpoint = f"{self.BASE_URL}/events/{event_ticker}"
+            path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
+            path = f"{path_prefix}/events/{event_ticker}"
+            headers = self._signed_headers('GET', path)
+            response = self.session.get(endpoint, headers=headers if headers else None)
+            if response.status_code == 200:
+                return response.json().get('event')
+            return None
+        except Exception as e:
+            print(f"Error fetching event {event_ticker}: {e}")
+            return None
     
     def get_market(self, ticker: str) -> Optional[Dict]:
         """Get specific market by ticker"""
@@ -200,7 +233,12 @@ class KalshiAPI:
             return None
     
     def get_orderbook(self, ticker: str) -> Dict:
-        """Get orderbook for a market"""
+        """Get orderbook for a market.
+        
+        Kalshi API returns:
+            {"orderbook": {"yes": [[price, qty], ...], "no": [[price, qty], ...]}}
+        The yes/no arrays represent resting limit orders (asks) at each price level.
+        """
         self._ensure_auth()
         try:
             endpoint = f"{self.BASE_URL}/markets/{ticker}/orderbook"
@@ -211,11 +249,13 @@ class KalshiAPI:
             
             if response.status_code == 200:
                 data = response.json()
+                ob = data.get('orderbook', data)
+                yes_levels = ob.get('yes') or []  # [[price, qty], ...]
+                no_levels = ob.get('no') or []
+
                 return {
-                    'yes_bids': data.get('yes', {}).get('bids', []),
-                    'yes_asks': data.get('yes', {}).get('asks', []),
-                    'no_bids': data.get('no', {}).get('bids', []),
-                    'no_asks': data.get('no', {}).get('asks', []),
+                    'yes_asks': yes_levels,   # Each element is [price_cents, quantity]
+                    'no_asks': no_levels,
                     'timestamp': time.time()
                 }
             return {}
@@ -365,10 +405,63 @@ class KalshiArbitrageBot:
         self.opportunities_found = []
         self.notifier = NotificationManager()
     
+    def _check_expiry(self, market: Dict) -> bool:
+        """Return True if market settles within the allowed time window.
+        
+        Rejects markets that:
+          - Close too soon (< MIN_EXPIRY_MINUTES)
+          - Close too far out (> MAX_EXPIRY_HOURS) — we want same-day settlement
+        """
+        close_time_str = market.get('close_time') or market.get('expiration_time')
+        if not close_time_str:
+            return False  # No close time = can't verify settlement window
+        try:
+            close_time = datetime.fromisoformat(close_time_str.replace('Z', '+00:00'))
+            now = datetime.now(timezone.utc)
+            minutes_remaining = (close_time - now).total_seconds() / 60
+            if minutes_remaining < Config.MIN_EXPIRY_MINUTES:
+                return False
+            max_minutes = Config.MAX_EXPIRY_HOURS * 60
+            if minutes_remaining > max_minutes:
+                return False  # Settles too far in the future
+        except (ValueError, TypeError):
+            return False
+        return True
+
+    def _max_executable_qty(self, orderbook: Dict, side: str = 'both') -> int:
+        """Calculate maximum executable quantity from orderbook depth.
+        
+        For arbitrage we need to buy both YES and NO, so the max quantity
+        is limited by the thinnest side's available volume at the best price.
+        """
+        try:
+            if side in ('both', 'yes'):
+                yes_asks = orderbook.get('yes_asks', [])
+                if not yes_asks:
+                    return 0
+                best_yes = min(yes_asks, key=lambda x: x[0])
+                yes_qty = best_yes[1] if len(best_yes) > 1 else 1
+            else:
+                yes_qty = float('inf')
+
+            if side in ('both', 'no'):
+                no_asks = orderbook.get('no_asks', [])
+                if not no_asks:
+                    return 0
+                best_no = min(no_asks, key=lambda x: x[0])
+                no_qty = best_no[1] if len(best_no) > 1 else 1
+            else:
+                no_qty = float('inf')
+
+            return int(min(yes_qty, no_qty))
+        except Exception:
+            return 1
+
     def analyze_market_mispricing(self, market: Dict, orderbook: Dict) -> Optional[Dict]:
         """
         Detect mispricing in a single market
-        YES + NO should equal 100 cents, look for deviations
+        YES + NO should equal 100 cents, look for deviations.
+        Applies strict filters to avoid illiquid traps.
         """
         try:
             yes_asks = orderbook.get('yes_asks', [])
@@ -379,50 +472,138 @@ class KalshiArbitrageBot:
             
             best_yes_ask = min([ask[0] for ask in yes_asks])
             best_no_ask = min([ask[0] for ask in no_asks])
+
+            # Filter: ignore penny orders (likely stale/trap)
+            if best_yes_ask < self.MIN_PRICE_CENTS or best_no_ask < self.MIN_PRICE_CENTS:
+                return None
             
             total_cost = best_yes_ask + best_no_ask
             guaranteed_payout = 100
             
             profit = guaranteed_payout - total_cost
+            if total_cost <= 0:
+                return None
             profit_percent = (profit / total_cost) * 100
             
-            if profit_percent > self.min_profit_percent:
-                # Add expiry check
-                close_time_str = market.get('close_time') or market.get('expiration_time')
-                if close_time_str:
-                    try:
-                        # Kalshi returns ISO 8601 timestamps
-                        close_time = datetime.fromisoformat(close_time_str.replace('Z', '+00:00'))
-                        now = datetime.now(timezone.utc)
-                        minutes_remaining = (close_time - now).total_seconds() / 60
-                        if minutes_remaining < Config.MIN_EXPIRY_MINUTES:
-                            return None  # Too close to expiry, skip
-                    except (ValueError, TypeError):
-                        pass  # If parsing fails, don't filter
-                
-                return {
-                    'ticker': market.get('ticker'),
-                    'title': market.get('title'),
-                    'yes_price': best_yes_ask,
-                    'no_price': best_no_ask,
-                    'total_cost': total_cost,
-                    'profit_cents': profit,
-                    'profit_percent': profit_percent,
-                    'strategy': 'Buy both YES and NO, guaranteed profit on settlement',
-                    'timestamp': datetime.now().isoformat()
-                }
+            # Must be profitable but also realistic (not a 4900% illiquid trap)
+            if profit_percent <= self.min_profit_percent:
+                return None
+            if profit_percent > self.MAX_PROFIT_PERCENT:
+                return None  # Too good to be true — illiquid market
+
+            if not self._check_expiry(market):
+                return None
+
+            max_qty = self._max_executable_qty(orderbook)
+
+            # Must have enough depth to actually execute
+            if max_qty < self.MIN_QTY_AT_BEST:
+                return None
             
-            return None
+            return {
+                'ticker': market.get('ticker'),
+                'title': market.get('title'),
+                'yes_price': best_yes_ask,
+                'no_price': best_no_ask,
+                'total_cost': total_cost,
+                'profit_cents': profit,
+                'profit_percent': profit_percent,
+                'max_executable_qty': max_qty,
+                'strategy': 'Buy both YES and NO, guaranteed profit on settlement',
+                'timestamp': datetime.now().isoformat()
+            }
             
         except Exception as e:
             print(f"Error analyzing market: {e}")
+            return None
+
+    def analyze_event_arbitrage(self, event_markets: List[Dict]) -> Optional[Dict]:
+        """Detect multi-outcome event arbitrage.
+        
+        In an event with N mutually exclusive outcomes, exactly one resolves YES.
+        If the sum of best YES ask prices across all outcomes < 100¢,
+        buying YES on every outcome guarantees profit.
+        """
+        if len(event_markets) < 2:
+            return None
+
+        try:
+            legs = []
+            total_cost = 0
+            min_qty = float('inf')
+
+            for market in event_markets:
+                ticker = market.get('ticker')
+                orderbook = self.api.get_orderbook(ticker)
+                if not orderbook:
+                    return None
+
+                yes_asks = orderbook.get('yes_asks', [])
+                if not yes_asks:
+                    return None
+
+                best_ask = min([a[0] for a in yes_asks])
+
+                # Filter: ignore penny orders
+                if best_ask < self.MIN_PRICE_CENTS:
+                    return None
+
+                # Volume available at best ask
+                best_ask_qty = next((a[1] for a in yes_asks if a[0] == best_ask), 1)
+                if best_ask_qty < self.MIN_QTY_AT_BEST:
+                    return None
+
+                min_qty = min(min_qty, best_ask_qty)
+
+                total_cost += best_ask
+                legs.append({
+                    'ticker': ticker,
+                    'title': market.get('title', ''),
+                    'yes_price': best_ask,
+                    'available_qty': best_ask_qty
+                })
+
+                if not self._check_expiry(market):
+                    return None
+
+                time.sleep(0.15)  # Rate limit between orderbook calls
+
+            guaranteed_payout = 100  # Exactly one outcome pays $1
+            profit = guaranteed_payout - total_cost
+            if total_cost <= 0:
+                return None
+            profit_percent = (profit / total_cost) * 100
+
+            # Must be profitable but realistic
+            if profit_percent <= self.min_profit_percent:
+                return None
+            if profit_percent > self.MAX_PROFIT_PERCENT:
+                return None  # Illiquid trap
+
+            if profit_percent > self.min_profit_percent:
+                return {
+                    'type': 'multi_leg',
+                    'event_ticker': event_markets[0].get('event_ticker', 'unknown'),
+                    'num_legs': len(legs),
+                    'legs': legs,
+                    'total_cost': total_cost,
+                    'profit_cents': profit,
+                    'profit_percent': profit_percent,
+                    'max_executable_qty': int(min_qty),
+                    'strategy': f'Buy YES on all {len(legs)} outcomes — exactly one pays $1',
+                    'timestamp': datetime.now().isoformat()
+                }
+            return None
+
+        except Exception as e:
+            print(f"Error analyzing event arbitrage: {e}")
             return None
     
     def scan_all_markets(self, category_filter: Optional[str] = None) -> List[Dict]:
         """Scan all markets for arbitrage opportunities"""
         print(f"🔍 Scanning Kalshi markets...")
         
-        markets = self.api.get_markets(status="open")
+        markets = self.api.get_all_markets(status="open")
         print(f"Found {len(markets)} open markets")
         
         opportunities = []
@@ -460,16 +641,74 @@ class KalshiArbitrageBot:
         
         return opportunities
     
-    def scan_all_markets_concurrent(self, category_filter: Optional[str] = None, max_workers: int = 5) -> List[Dict]:
+    # Minimum thresholds to filter out illiquid trap markets
+    MIN_PRICE_CENTS = 3       # Ignore asks below 3¢ (stale penny orders)
+    MIN_VOLUME = 10           # Market must have at least this many trades
+    MAX_PROFIT_PERCENT = 15.0 # Cap: real arb is 0.5-10%, not 4900%
+    MIN_QTY_AT_BEST = 2       # Must have ≥2 contracts at best ask
+
+    def _prefilter_markets(self, markets: List[Dict]) -> List[Dict]:
+        """Pre-filter markets using listing data to avoid fetching orderbooks for dead markets.
+        
+        The /markets response includes yes_ask, no_ask, volume, liquidity fields.
+        We only deep-scan markets that:
+         1. Settle within our time window (MAX_EXPIRY_HOURS)
+         2. Have both yes_ask and no_ask above MIN_PRICE_CENTS
+         3. Have meaningful volume or open interest
+         4. Quick-check: yes_ask + no_ask < 100 (potential arb)
+        """
+        candidates = []
+        now = datetime.now(timezone.utc)
+        min_minutes = Config.MIN_EXPIRY_MINUTES
+        max_minutes = Config.MAX_EXPIRY_HOURS * 60
+
+        for m in markets:
+            # --- Time filter first (cheapest check, eliminates most markets) ---
+            close_time_str = m.get('close_time') or m.get('expiration_time')
+            if not close_time_str:
+                continue
+            try:
+                close_time = datetime.fromisoformat(close_time_str.replace('Z', '+00:00'))
+                minutes_remaining = (close_time - now).total_seconds() / 60
+                if minutes_remaining < min_minutes or minutes_remaining > max_minutes:
+                    continue
+            except (ValueError, TypeError):
+                continue
+
+            yes_ask = m.get('yes_ask') or 0
+            no_ask = m.get('no_ask') or 0
+            volume = m.get('volume') or 0
+            open_interest = m.get('open_interest') or 0
+
+            # Must have both sides quoted above minimum price
+            if yes_ask < self.MIN_PRICE_CENTS or no_ask < self.MIN_PRICE_CENTS:
+                continue
+
+            # Must have real trading activity
+            if volume < self.MIN_VOLUME and open_interest < self.MIN_VOLUME:
+                continue
+
+            # Quick arb pre-screen: total cost must be below payout
+            # Allow 5¢ buffer since orderbook depth might have better prices
+            if yes_ask + no_ask <= 105:
+                candidates.append(m)
+
+        return candidates
+
+    def scan_all_markets_concurrent(self, category_filter: Optional[str] = None, max_workers: int = 10) -> List[Dict]:
         """Scan all markets using concurrent threads for speed."""
         print(f"🔍 Scanning Kalshi markets (concurrent, {max_workers} workers)...")
 
-        markets = self.api.get_markets(status="open")
-        print(f"Found {len(markets)} open markets")
+        markets = self.api.get_all_markets(status="open")
+        print(f"Found {len(markets)} total open markets")
 
         if category_filter:
             markets = [m for m in markets if category_filter.upper() in m.get('title', '').upper()]
             print(f"Filtered to {len(markets)} markets matching '{category_filter}'")
+
+        # Pre-filter to liquid, potentially profitable markets
+        candidates = self._prefilter_markets(markets)
+        print(f"🎯 {len(candidates)} markets pass pre-filter (both sides quoted, liquid, near arb)")
 
         opportunities = []
 
@@ -485,15 +724,14 @@ class KalshiArbitrageBot:
                 return None
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_scan_one, m): m for m in markets}
+            futures = {executor.submit(_scan_one, m): m for m in candidates}
             scanned = 0
             for future in as_completed(futures):
                 scanned += 1
                 market = futures[future]
                 ticker = market.get('ticker')
-                title = market.get('title', '')
-                if scanned % 50 == 0 or scanned == len(markets):
-                    print(f"Progress: {scanned}/{len(markets)} markets scanned...")
+                if scanned % 100 == 0 or scanned == len(candidates):
+                    print(f"Progress: {scanned}/{len(candidates)} markets scanned...")
                 try:
                     result = future.result()
                     if result:
@@ -502,6 +740,51 @@ class KalshiArbitrageBot:
                         self.notifier.notify_opportunity(result)
                 except Exception as e:
                     print(f"  Error processing {ticker}: {e}")
+
+        # --- Multi-outcome event arbitrage ---
+        # Group markets by event_ticker, but only those within our time window
+        # Only check events where at least 2 markets have nonzero yes_ask
+        events = {}
+        now_utc = datetime.now(timezone.utc)
+        min_mins = Config.MIN_EXPIRY_MINUTES
+        max_mins = Config.MAX_EXPIRY_HOURS * 60
+        for m in markets:
+            et = m.get('event_ticker')
+            if not et or (m.get('yes_ask') or 0) <= 0:
+                continue
+            # Apply same time window filter
+            ct = m.get('close_time') or m.get('expiration_time')
+            if not ct:
+                continue
+            try:
+                ct_dt = datetime.fromisoformat(ct.replace('Z', '+00:00'))
+                mins_left = (ct_dt - now_utc).total_seconds() / 60
+                if mins_left < min_mins or mins_left > max_mins:
+                    continue
+            except (ValueError, TypeError):
+                continue
+            events.setdefault(et, []).append(m)
+
+        multi_events = {k: v for k, v in events.items() if len(v) >= 2}
+        
+        # Quick pre-filter: sum of yes_asks across legs should be < 105 to be worth checking
+        promising_events = {}
+        for et, ev_markets in multi_events.items():
+            total_yes = sum(m.get('yes_ask', 0) for m in ev_markets)
+            if total_yes < 105:
+                promising_events[et] = ev_markets
+
+        if promising_events:
+            print(f"\n🔗 Scanning {len(promising_events)} promising multi-outcome events...")
+            for event_ticker, event_markets in promising_events.items():
+                try:
+                    result = self.analyze_event_arbitrage(event_markets)
+                    if result:
+                        opportunities.append(result)
+                        print(f"  ✅ EVENT ARB: {event_ticker} — {result['num_legs']} legs, {result['profit_cents']}¢ ({result['profit_percent']:.2f}%)")
+                        self.notifier.notify_opportunity(result)
+                except Exception as e:
+                    print(f"  Error scanning event {event_ticker}: {e}")
 
         return opportunities
     
@@ -642,18 +925,14 @@ class KalshiTradingBot:
                 print(f"\n⚠️  Trade exceeds configured max (${Config.MAX_TRADE_USD:.2f}). Refusing to place live orders.")
                 return False
 
-            print(f"\n⚠️  LIVE TRADING MODE - About to place real orders (SAFE MODE)")
+            print(f"\n🚀 LIVE TRADING MODE - AUTO-EXECUTING ARBITRAGE")
             print(f"Market: {opportunity['title']}")
             print(f"YES price: ${yes_price/100:.2f} x {quantity}")
             print(f"NO price: ${no_price/100:.2f} x {quantity}")
             print(f"Total cost: ${total_cost:.2f}")
-
-            confirmation = input("Type 'YES' to confirm and place live orders: ").strip().upper()
-            if confirmation != 'YES':
-                print("Aborted by user. No orders placed.")
-                return False
-
-            print("Placing YES order...")
+            print(f"Expected profit: ${quantity - total_cost:.2f}")
+            
+            print("\nPlacing YES order...")
             yes_order = self.api.place_order(ticker, 'yes', quantity, yes_price, order_type='limit')
             print("Placing NO order...")
             no_order = self.api.place_order(ticker, 'no', quantity, no_price, order_type='limit')
@@ -805,8 +1084,9 @@ def main():
     print("5. View historical stats")
     print("6. Reconcile settled positions & view P&L")
     print("7. Reconcile positions with exchange")
+    print("8. Continuous auto-trading scanner 🤖 (finds & executes arbitrage)")
     
-    choice = input("\nEnter choice (1-7): ").strip()
+    choice = input("\nEnter choice (1-8): ").strip()
     
     if choice == "1":
         opportunities = bot.scan_all_markets_concurrent()
@@ -850,6 +1130,142 @@ def main():
     elif choice == "7":
         trader = KalshiTradingBot(api, initial_balance=1000.0, paper_trading=True)
         trader.reconcile_with_exchange()
+    
+    elif choice == "8":
+        # Continuous auto-trading scanner
+        print("\n" + "="*60)
+        print("🤖 CONTINUOUS AUTO-TRADING SCANNER")
+        print("="*60)
+        print(f"Scan interval: {Config.SCAN_INTERVAL_SECONDS}s")
+        print(f"Min profit: {Config.MIN_PROFIT_PERCENT}%")
+        print(f"Live trading: {'ENABLED ⚠️' if Config.LIVE_TRADING_ENABLED else 'DISABLED (paper only)'}")
+        print(f"Max trade: ${Config.MAX_TRADE_USD}")
+        print(f"Max exposure: ${Config.MAX_EXPOSURE_USD}")
+        print(f"Press Ctrl+C to stop")
+        print("="*60 + "\n")
+        
+        # Initialize trader with live balance
+        starting_balance = api.get_balance() if Config.LIVE_TRADING_ENABLED else 250.0
+        trader = KalshiTradingBot(
+            api, 
+            initial_balance=starting_balance,
+            paper_trading=not Config.LIVE_TRADING_ENABLED
+        )
+        
+        iteration = 0
+        try:
+            while True:
+                iteration += 1
+                print(f"\n{'='*60}")
+                print(f"Scan #{iteration} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"{'='*60}")
+                
+                # Scan all markets (single-market + multi-outcome event arbitrage)
+                opportunities = bot.scan_all_markets_concurrent()
+                
+                if opportunities:
+                    # Sort by profit % descending — execute best opportunities first
+                    opportunities.sort(key=lambda o: o.get('profit_percent', 0), reverse=True)
+                    print(f"\n✅ Found {len(opportunities)} arbitrage opportunities (sorted by profit %)")
+                    
+                    for opp in opportunities:
+                        opp_type = opp.get('type', 'single')
+                        ticker_label = opp.get('event_ticker') if opp_type == 'multi_leg' else opp.get('ticker')
+                        
+                        # Calculate maximum affordable quantity
+                        max_from_book = opp.get('max_executable_qty', 1)
+                        cost_per_contract = opp.get('total_cost', 100)  # cents
+                        max_from_balance = int((trader.balance * 100) / cost_per_contract) if cost_per_contract > 0 else 0
+                        max_from_trade_limit = int((Config.MAX_TRADE_USD * 100) / cost_per_contract) if cost_per_contract > 0 else 0
+                        
+                        quantity = max(1, min(max_from_book, max_from_balance, max_from_trade_limit))
+                        
+                        print(f"\n🎯 {'EVENT' if opp_type == 'multi_leg' else 'MARKET'}: {ticker_label} ({opp['profit_percent']:.2f}% profit, qty={quantity})")
+                        
+                        if opp_type == 'multi_leg':
+                            # Multi-leg: place YES orders on each leg
+                            print(f"   Multi-leg trade: {opp.get('num_legs')} outcomes")
+                            if not Config.LIVE_TRADING_ENABLED:
+                                # Paper trade
+                                total_cost_usd = (cost_per_contract * quantity) / 100
+                                trade = {
+                                    'ticker': opp.get('event_ticker'),
+                                    'type': 'multi_leg_arbitrage',
+                                    'quantity': quantity,
+                                    'legs': opp.get('legs', []),
+                                    'cost': total_cost_usd,
+                                    'expected_profit': (quantity * 100 - cost_per_contract * quantity) / 100,
+                                    'timestamp': datetime.now().isoformat()
+                                }
+                                trader.trade_history.append(trade)
+                                trader.balance -= total_cost_usd
+                                trader.positions.append(trade)
+                                print(f"   📄 Paper trade recorded: ${total_cost_usd:.2f}")
+                            else:
+                                # Live multi-leg execution
+                                total_cost_usd = (cost_per_contract * quantity) / 100
+                                if total_cost_usd > Config.MAX_TRADE_USD:
+                                    print(f"   ⚠️ Exceeds max trade (${total_cost_usd:.2f} > ${Config.MAX_TRADE_USD})")
+                                    continue
+                                
+                                all_orders = []
+                                failed = False
+                                for leg in opp.get('legs', []):
+                                    order = api.place_order(leg['ticker'], 'yes', quantity, leg['yes_price'], order_type='limit')
+                                    if order:
+                                        all_orders.append(order)
+                                    else:
+                                        print(f"   ❌ Failed on leg {leg['ticker']} — attempting to cancel previous legs")
+                                        for prev_order in all_orders:
+                                            api.cancel_order(prev_order.get('order_id', ''))
+                                        failed = True
+                                        break
+                                    time.sleep(0.5)
+                                
+                                if not failed:
+                                    trade = {
+                                        'ticker': opp.get('event_ticker'),
+                                        'type': 'multi_leg_arbitrage',
+                                        'quantity': quantity,
+                                        'cost': total_cost_usd,
+                                        'expected_profit': (quantity * 100 - cost_per_contract * quantity) / 100,
+                                        'timestamp': datetime.now().isoformat(),
+                                        'orders': all_orders
+                                    }
+                                    trader.trade_history.append(trade)
+                                    trader.balance -= total_cost_usd
+                                    trader.positions.append(trade)
+                                    print(f"   ✅ All {len(all_orders)} legs executed!")
+                        else:
+                            # Single-market arbitrage
+                            success = trader.execute_arbitrage(opp, quantity=quantity)
+                            if success:
+                                print(f"   ✅ Trade executed")
+                            else:
+                                print(f"   ⚠️ Trade not executed (safety limits)")
+                        
+                        time.sleep(0.5)
+                else:
+                    print(f"\n📊 No arbitrage opportunities found this scan")
+                
+                # Print current stats
+                trader.print_stats()
+                
+                # Wait for next scan
+                print(f"\n⏳ Waiting {Config.SCAN_INTERVAL_SECONDS}s until next scan...")
+                print(f"Total scans: {iteration} | Total trades: {len(trader.trade_history)}")
+                time.sleep(Config.SCAN_INTERVAL_SECONDS)
+                
+        except KeyboardInterrupt:
+            print(f"\n\n{'='*60}")
+            print("🛑 Scanner stopped by user")
+            print(f"{'='*60}")
+            trader.print_stats()
+            print("\nFinal summary:")
+            print(f"- Total scans: {iteration}")
+            print(f"- Total opportunities found: {len(bot.opportunities_found)}")
+            print(f"- Total trades executed: {len(trader.trade_history)}")
+            print(f"{'='*60}")
     
     else:
         print("Invalid choice")
