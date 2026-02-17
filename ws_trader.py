@@ -934,8 +934,23 @@ class WSConvergenceTrader:
 
     async def _session(self):
         """Single WS session: connect, subscribe, process messages."""
+        # Settle any paper trades from events that expired before this session
+        if self.config.PAPER_TRADING and self.paper_trades:
+            # Get current active events from a fresh scan
+            pre_scan_events = set(t['event'] for t in self.paper_trades)
+            # We'll check after scan_markets rebuilds market_meta
+
         # Initial market scan
         tickers = self.scan_markets()
+
+        # Settle paper trades for events that are no longer active after the scan
+        if self.config.PAPER_TRADING and self.paper_trades:
+            active_events = set(m.get('event_ticker', '') for m in self.market_meta.values())
+            traded_events = set(t['event'] for t in self.paper_trades)
+            for ev in traded_events:
+                if ev not in active_events:
+                    self._settle_paper_trades(ev)
+
         if not tickers:
             logger.warning("No qualifying markets found. Waiting 30s to retry...")
             await asyncio.sleep(30)
@@ -1086,21 +1101,35 @@ def main():
     """Entry point for WS convergence trader."""
     import sys
     import io
+    import traceback
 
     # Fix Windows console encoding for emoji characters
     if sys.stdout.encoding != 'utf-8':
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
-    # Set up logging
+    # Set up logging — use a custom FileHandler subclass that flushes every write
+    class FlushFileHandler(logging.FileHandler):
+        def emit(self, record):
+            super().emit(record)
+            self.flush()
+
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler('ws_trader.log', mode='a', encoding='utf-8'),
+            FlushFileHandler('ws_trader.log', mode='a', encoding='utf-8'),
         ]
     )
+
+    # Catch ALL uncaught exceptions and log them (never die silently)
+    def handle_exception(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        logger.critical("UNCAUGHT EXCEPTION — bot died!", exc_info=(exc_type, exc_value, exc_traceback))
+    sys.excepthook = handle_exception
 
     from kalshi_bot import KalshiAPI
 
@@ -1123,6 +1152,9 @@ def main():
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
         trader.stop()
+    except Exception:
+        logger.critical("FATAL ERROR — bot crashed:\n%s", traceback.format_exc())
+        raise
 
 
 if __name__ == '__main__':
