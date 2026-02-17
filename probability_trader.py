@@ -120,7 +120,9 @@ class ProbabilityTrader:
         try:
             # Pattern: KXBTC-<DATE>-<T|B><STRIKE>
             # T = above (ticker), B = below
-            pattern = r'KX(BTC|ETH)-(\d{2}[A-Z]{3}\d{2})-([TB])(\d+)'
+            # Date can be 6+ chars like 26FEB16 or 26FEB1717 (includes hour)
+            # Strike can have decimals like T78249.99
+            pattern = r'KX(BTC|ETH)-(\d{2}[A-Z]{3}\d{2,6})-([TB])(\d+(?:\.\d+)?)'
             match = re.match(pattern, ticker)
             
             if not match:
