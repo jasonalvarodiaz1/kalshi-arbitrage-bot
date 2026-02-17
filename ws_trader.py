@@ -8,7 +8,7 @@ moves, dramatically improving execution quality.
 Architecture:
   1. REST API: Initial market scan to find near-expiry events
   2. WebSocket: Stream orderbook_delta + ticker for those markets
-  3. CoinGecko: BTC/ETH price feed (still polled, 15s cache)
+  3. CoinGecko: BTC/ETH/DOGE/XRP price feed (still polled, 15s cache)
   4. On each orderbook/ticker update: re-evaluate model → trade if edge found
 
 Connection: wss://api.elections.kalshi.com/trade-api/ws/v2
@@ -116,7 +116,7 @@ class WSConvergenceTrader:
         self.min_book_depth = 5        # Min contracts available at price level
 
         # Vol estimates
-        self.base_vol = {'BTC': 0.0015, 'ETH': 0.0020}
+        self.base_vol = {'BTC': 0.0015, 'ETH': 0.0020, 'DOGE': 0.0030, 'XRP': 0.0025}
         self.calibrated_vol: Dict[str, float] = {}  # {event_ticker: implied_vol}
 
         # WebSocket state
@@ -217,33 +217,37 @@ class WSConvergenceTrader:
                 return price
         return self._fetch_prices().get(asset)
 
+    _ASSETS = ['BTC', 'ETH', 'DOGE', 'XRP']
+    _COIN_IDS = 'bitcoin,ethereum,dogecoin,ripple'
+    _ASSET_MAP = [('BTC', 'bitcoin'), ('ETH', 'ethereum'), ('DOGE', 'dogecoin'), ('XRP', 'ripple')]
+
     def _fetch_prices(self) -> Dict[str, float]:
         now = time.time()
         all_fresh = all(
             a in self.price_cache and now - self.price_cache[a][1] < self.price_cache_ttl
-            for a in ['BTC', 'ETH']
+            for a in self._ASSETS
         )
         if all_fresh:
-            return {a: self.price_cache[a][0] for a in ['BTC', 'ETH'] if a in self.price_cache}
+            return {a: self.price_cache[a][0] for a in self._ASSETS if a in self.price_cache}
         try:
             r = requests.get(
                 "https://api.coingecko.com/api/v3/simple/price",
-                params={'ids': 'bitcoin,ethereum', 'vs_currencies': 'usd'},
+                params={'ids': self._COIN_IDS, 'vs_currencies': 'usd'},
                 timeout=5
             )
             if r.status_code == 429:
-                return {a: self.price_cache[a][0] for a in ['BTC', 'ETH'] if a in self.price_cache}
+                return {a: self.price_cache[a][0] for a in self._ASSETS if a in self.price_cache}
             r.raise_for_status()
             data = r.json()
             result = {}
-            for asset, cid in [('BTC', 'bitcoin'), ('ETH', 'ethereum')]:
+            for asset, cid in self._ASSET_MAP:
                 p = data.get(cid, {}).get('usd')
                 if p:
                     self.price_cache[asset] = (p, now)
                     result[asset] = p
             return result
         except Exception:
-            return {a: self.price_cache[a][0] for a in ['BTC', 'ETH'] if a in self.price_cache}
+            return {a: self.price_cache[a][0] for a in self._ASSETS if a in self.price_cache}
 
     # ─── REST market scanning ────────────────────────────────────────────
 
@@ -252,6 +256,10 @@ class WSConvergenceTrader:
             return 'BTC'
         if 'KXETH' in ticker:
             return 'ETH'
+        if 'KXDOGE' in ticker:
+            return 'DOGE'
+        if 'KXXRP' in ticker:
+            return 'XRP'
         return None
 
     def _minutes_until(self, close_time: str) -> Optional[float]:
@@ -272,20 +280,27 @@ class WSConvergenceTrader:
         try:
             btc = self.api.get_all_markets(status="open", series_ticker="KXBTC")
             eth = self.api.get_all_markets(status="open", series_ticker="KXETH")
+            doge = self.api.get_all_markets(status="open", series_ticker="KXDOGE")
+            xrp = self.api.get_all_markets(status="open", series_ticker="KXXRP")
         except Exception as e:
             logger.error("REST scan failed: %s", e)
             return []
 
-        all_markets = btc + eth
+        all_markets = btc + eth + doge + xrp
         events: Dict[str, List[Dict]] = {}
         for m in all_markets:
             et = m.get('event_ticker', '')
             events.setdefault(et, []).append(m)
 
-        prices = {'BTC': self.get_price('BTC'), 'ETH': self.get_price('ETH')}
-        logger.info("Prices: BTC=$%s  ETH=$%s",
-                     f"{prices['BTC']:,.0f}" if prices.get('BTC') else "N/A",
-                     f"{prices['ETH']:,.0f}" if prices.get('ETH') else "N/A")
+        prices = {a: self.get_price(a) for a in self._ASSETS}
+        price_parts = []
+        for a in self._ASSETS:
+            p = prices.get(a)
+            if a in ('BTC', 'ETH'):
+                price_parts.append(f"{a}=${p:,.0f}" if p else f"{a}=$N/A")
+            else:
+                price_parts.append(f"{a}=${p:.4f}" if p else f"{a}=$N/A")
+        logger.info("Prices: %s", "  ".join(price_parts))
 
         for event_ticker, brackets in events.items():
             ct = brackets[0].get('close_time', '')
@@ -298,6 +313,19 @@ class WSConvergenceTrader:
                 continue
 
             current_price = prices[asset]
+
+            # Extract floor/cap strikes — use custom_strike if standard fields are missing
+            for b in brackets:
+                if b.get('floor_strike') is None or b.get('cap_strike') is None:
+                    cs = b.get('custom_strike', {})
+                    if cs:
+                        try:
+                            if cs.get('floor_strike') and b.get('floor_strike') is None:
+                                b['floor_strike'] = float(cs['floor_strike'])
+                            if cs.get('cap_strike') and b.get('cap_strike') is None:
+                                b['cap_strike'] = float(cs['cap_strike'])
+                        except (ValueError, TypeError):
+                            pass
 
             # Calibrate implied vol from ATM bracket
             sorted_b = sorted(brackets, key=lambda b: b.get('floor_strike') or 0)
@@ -1063,9 +1091,13 @@ class WSConvergenceTrader:
                     if self.config.PAPER_TRADING:
                         # Check which events we had trades on that are no longer active
                         traded_events = set(t['event'] for t in self.paper_trades)
-                        for ev in traded_events:
-                            if ev not in active_events:
-                                self._settle_paper_trades(ev)
+                        if traded_events:
+                            gone = traded_events - active_events
+                            if gone:
+                                logger.info("Settlement check: %d traded events no longer active: %s", len(gone), gone)
+                            for ev in traded_events:
+                                if ev not in active_events:
+                                    self._settle_paper_trades(ev)
 
                     # Remove traded_tickers entries for events that are no longer active
                     expired_keys = []
