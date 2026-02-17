@@ -498,6 +498,12 @@ class WSConvergenceTrader:
         if trade_key in self.traded_tickers:
             return False
 
+        # Prevent trading opposite side on same bracket (guaranteed loss)
+        opposite = 'no' if opp['side'] == 'yes' else 'yes'
+        opposite_key = f"{opp['ticker']}_{opposite}"
+        if opposite_key in self.traded_tickers:
+            return False
+
         # Check per-event trade cap
         event = opp.get('event', '')
         if self.event_trade_count.get(event, 0) >= self.max_trades_per_event:
@@ -757,9 +763,19 @@ class WSConvergenceTrader:
         event_wins = 0
         event_losses = 0
 
+        def _fmt_price(p):
+            if p is None:
+                return 'N/A'
+            if abs(p) < 1:
+                return f'{p:.6f}'
+            elif abs(p) < 100:
+                return f'{p:.4f}'
+            else:
+                return f'{p:,.0f}'
+
         logger.info("")
         logger.info("=" * 60)
-        logger.info("SETTLEMENT: %s  |  %s @ $%s", event_ticker, asset, f"{settle_price:,.0f}")
+        logger.info("SETTLEMENT: %s  |  %s @ $%s", event_ticker, asset, _fmt_price(settle_price))
         logger.info("=" * 60)
 
         results_rows = []
@@ -793,8 +809,8 @@ class WSConvergenceTrader:
             else:
                 event_losses += 1
 
-            floor_str = f"${floor_s:,.0f}" if floor_s else "(-inf)"
-            cap_str = f"${cap_s:,.0f}" if cap_s else "(+inf)"
+            floor_str = f"${_fmt_price(floor_s)}" if floor_s else "(-inf)"
+            cap_str = f"${_fmt_price(cap_s)}" if cap_s else "(+inf)"
             result_str = "WIN" if won else "LOSS"
 
             logger.info("  %s %s %s x%d @ %dc → %s  pnl=$%.2f  (bracket: %s—%s)",
@@ -805,7 +821,7 @@ class WSConvergenceTrader:
             results_rows.append([
                 datetime.now(timezone.utc).isoformat(), event_ticker,
                 trade['ticker'], asset, side, qty, trade['price'],
-                f"{cost:.2f}", floor_s or '', cap_s or '', f"{settle_price:.0f}",
+                f"{cost:.2f}", floor_s or '', cap_s or '', _fmt_price(settle_price),
                 won, f"{payout:.2f}", f"{pnl:.2f}",
                 f"{trade['model_prob']:.4f}", f"{trade['edge_pct']:.1f}",
                 f"{trade['minutes_left']:.0f}",
