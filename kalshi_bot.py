@@ -433,7 +433,8 @@ class KalshiAPI:
             return 0.0
     
     def place_order(self, ticker: str, side: str, quantity: int, 
-                    price: int, order_type: str = "limit") -> Optional[Dict]:
+                    price: int, order_type: str = "limit",
+                    expiration_ts: int = None) -> Optional[Dict]:
         """
         Place an order (REAL MONEY - BE CAREFUL!)
         
@@ -443,6 +444,7 @@ class KalshiAPI:
             quantity: Number of contracts
             price: Price in cents (e.g., 50 = $0.50)
             order_type: "limit" or "market"
+            expiration_ts: Unix timestamp for order expiration (auto-cancel)
         """
         self._ensure_auth()
         try:
@@ -454,7 +456,8 @@ class KalshiAPI:
                 "count": quantity,
                 "type": order_type,
                 "yes_price": price if side == "yes" else None,
-                "no_price": price if side == "no" else None
+                "no_price": price if side == "no" else None,
+                "expiration_ts": expiration_ts,
             }
             
             payload = {k: v for k, v in payload.items() if v is not None}

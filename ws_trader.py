@@ -86,15 +86,17 @@ class WSConvergenceTrader:
         # Each entry: {order_id, ticker, side, qty, price, placed_at, status}
         self.pending_orders: Dict[str, Dict] = {}
         self.filled_orders: List[Dict] = []     # completed fills for P&L tracking
-        self.order_timeout_secs = 15             # cancel unfilled orders after 15s
+        self.order_timeout_secs = 30             # cancel unfilled orders after 30s (orders also auto-expire at 60s)
         self._order_check_interval = 5           # poll pending orders every 5s
         self._last_order_check = 0.0
 
         # Exposure tracking
         self.total_exposure = 0.0                # dollars currently at risk (cost of open positions)
-        self.max_total_exposure = float(getattr(Config, 'MAX_EXPOSURE_USD', 250.0))
-        self.max_trades_per_event = 5            # was 8 — reduce overtrading
+        self.max_total_exposure = float(getattr(Config, 'MAX_EXPOSURE_USD', 100.0))
+        self.max_trades_per_event = 3            # reduced from 5 — fewer trades per event
+        self.max_exposure_per_event = 30.0        # reduced from $50 — limit per-event risk
         self.event_trade_count: Dict[str, int] = {}  # {event_ticker: count}
+        self.event_exposure: Dict[str, float] = {}   # {event_ticker: dollars}
 
         # Paper settlement tracking
         self.paper_trades: List[Dict] = []       # all paper trades for settlement scoring
@@ -108,11 +110,11 @@ class WSConvergenceTrader:
         # Strategy params
         self.max_expiry_minutes = 60
         self.min_expiry_minutes = 2
-        self.min_confidence = 0.50               # was 0.30 — require higher model confidence
-        self.min_edge_pct = 5.0                   # was 2.0  — wider edge filter
+        self.min_confidence = 0.60               # Require 60%+ model confidence (ATM is ~50%, skip)
+        self.min_edge_pct = 8.0                   # Raised from 5% — need real edge, not noise
         self.max_trade_usd = float(getattr(self.config, 'MAX_TRADE_USD', 20.0))
-        self.max_contracts = 50
-        self.min_price_cents = 4                   # Skip orders <= 3c (phantom liquidity)
+        self.max_contracts = 30                      # Reduced from 50 — limit single-trade exposure
+        self.min_price_cents = 15                  # Skip cheap orders (< 15c never fill on NO side)
         self.max_yes_price_cents = 30              # NEW: don't buy YES above 30c (expensive YES loses)
         self.min_book_depth = 5                    # Min contracts available at price level
         self.atm_buffer_brackets = 1               # NEW: skip the ATM bracket (model worst there)
@@ -231,6 +233,21 @@ class WSConvergenceTrader:
         )
         if all_fresh:
             return {a: self.price_cache[a][0] for a in self._ASSETS if a in self.price_cache}
+
+        # Try CoinGecko first
+        result = self._try_coingecko(now)
+        if result:
+            return result
+
+        # Fallback: CryptoCompare (no key needed)
+        result = self._try_cryptocompare(now)
+        if result:
+            return result
+
+        # Last resort: return cached prices
+        return {a: self.price_cache[a][0] for a in self._ASSETS if a in self.price_cache}
+
+    def _try_coingecko(self, now: float) -> Optional[Dict[str, float]]:
         try:
             r = requests.get(
                 "https://api.coingecko.com/api/v3/simple/price",
@@ -238,7 +255,7 @@ class WSConvergenceTrader:
                 timeout=5
             )
             if r.status_code == 429:
-                return {a: self.price_cache[a][0] for a in self._ASSETS if a in self.price_cache}
+                return None
             r.raise_for_status()
             data = r.json()
             result = {}
@@ -247,9 +264,29 @@ class WSConvergenceTrader:
                 if p:
                     self.price_cache[asset] = (p, now)
                     result[asset] = p
-            return result
+            return result if result else None
         except Exception:
-            return {a: self.price_cache[a][0] for a in self._ASSETS if a in self.price_cache}
+            return None
+
+    def _try_cryptocompare(self, now: float) -> Optional[Dict[str, float]]:
+        try:
+            r = requests.get(
+                "https://min-api.cryptocompare.com/data/pricemulti",
+                params={'fsyms': 'BTC,ETH,DOGE,XRP', 'tsyms': 'USD'},
+                timeout=5
+            )
+            r.raise_for_status()
+            data = r.json()
+            cc_map = {'BTC': 'BTC', 'ETH': 'ETH', 'DOGE': 'DOGE', 'XRP': 'XRP'}
+            result = {}
+            for asset, sym in cc_map.items():
+                p = data.get(sym, {}).get('USD')
+                if p:
+                    self.price_cache[asset] = (p, now)
+                    result[asset] = p
+            return result if result else None
+        except Exception:
+            return None
 
     # ─── REST market scanning ────────────────────────────────────────────
 
@@ -408,33 +445,59 @@ class WSConvergenceTrader:
 
         model_prob = self.bracket_probability(current_price, floor_s, cap_s, mins_left, asset, impl_vol)
 
-        # Get best prices from WS orderbook or ticker data
+        # ───────────────────────────────────────────────────────────────
+        # Orderbook interpretation:
+        #   WS orderbook 'yes' / 'no' levels are BIDS (buy orders).
+        #   YES ask = 100 - max(NO bids)  (counterparty matching)
+        #   NO  ask = 100 - max(YES bids)
+        #   Depth at NO ask = depth at the matching YES bid level
+        # ───────────────────────────────────────────────────────────────
         td = self.ticker_data.get(ticker, {})
         ob = self.orderbooks.get(ticker, {})
 
-        # Prefer WS ticker data for bid/ask
-        yes_bid = td.get('yes_bid', 0) or 0
+        # YES bid/ask from ticker data
+        yes_bid_ticker = td.get('yes_bid', 0) or 0
         yes_ask = td.get('yes_ask', 0) or 0
 
-        # Fall back to orderbook best levels
-        if not yes_ask and ob.get('yes'):
-            # yes orderbook: sorted asks (lowest first)
-            yes_levels = ob['yes']
-            if yes_levels:
-                yes_ask = min(p for p, q in yes_levels)
-        if not yes_bid and ob.get('yes'):
-            yes_levels = ob['yes']
-            if yes_levels:
-                yes_bid = max(p for p, q in yes_levels)
+        # Orderbook levels (these are BIDS)
+        yes_bids = ob.get('yes', [])  # YES buy orders
+        no_bids = ob.get('no', [])    # NO buy orders
 
+        # Best YES bid from orderbook (most accurate for fill prices)
+        yes_bid_ob = max(p for p, q in yes_bids) if yes_bids else 0
+
+        # Use orderbook YES bid if available; fall back to ticker
+        yes_bid = yes_bid_ob if yes_bid_ob > 0 else yes_bid_ticker
+
+        # Derive YES ask from NO bids if ticker data unavailable
+        if not yes_ask and no_bids:
+            best_no_bid = max(p for p, q in no_bids)
+            yes_ask = 100 - best_no_bid
+
+        # NO ask = 100 - best YES bid (use orderbook for accuracy)
         no_ask = 0
-        if ob.get('no'):
-            no_levels = ob['no']
-            if no_levels:
-                no_ask = min(p for p, q in no_levels)
+        no_depth = 0
+        if yes_bid > 0:
+            no_ask = 100 - yes_bid
+            # Depth at NO ask = depth at the matching YES bid
+            for p, q in yes_bids:
+                if p == yes_bid:
+                    no_depth = q
+                    break
+            # If no orderbook depth, use a default minimum
+            if no_depth == 0:
+                no_depth = self.min_book_depth  # ticker data implies existence
+
+        # YES depth from NO bids at matching level
+        yes_depth = 0
+        if yes_ask > 0 and no_bids:
+            matching_no_bid = 100 - yes_ask
+            for p, q in no_bids:
+                if p == matching_no_bid:
+                    yes_depth = q
+                    break
 
         # Check YES opportunity — only if price is affordable
-        yes_depth = self._book_depth_at(ticker, 'yes', yes_ask) if yes_ask else 0
         if (yes_ask >= self.min_price_cents and yes_ask <= self.max_yes_price_cents
                 and yes_depth >= self.min_book_depth):
             implied_prob = yes_ask / 100.0
@@ -461,28 +524,39 @@ class WSConvergenceTrader:
 
         # Check NO opportunity — prefer cheap NO on far-OTM brackets
         model_prob_no = 1.0 - model_prob
-        no_depth = self._book_depth_at(ticker, 'no', no_ask) if no_ask else 0
-        if no_ask >= self.min_price_cents and no_ask < 95 and no_depth >= self.min_book_depth:
+
+        # SKIP ATM and near-ATM brackets for NO too — model is unreliable there
+        is_atm_no = False
+        if floor_s is not None and cap_s is not None:
+            bracket_width = cap_s - floor_s
+            # Skip if current price is within 2 bracket widths of this bracket
+            dist_to_bracket = min(abs(current_price - floor_s), abs(current_price - cap_s))
+            if current_price >= floor_s and current_price < cap_s:
+                dist_to_bracket = 0  # price is IN the bracket
+            if dist_to_bracket < bracket_width * 2.0:
+                is_atm_no = True  # wider ATM buffer (2x bracket width)
+
+        if is_atm_no:
+            pass  # Skip ATM/near-ATM NO trades entirely
+        elif no_ask >= self.min_price_cents and no_ask < 95 and no_depth >= self.min_book_depth:
             implied_prob_no = no_ask / 100.0
             edge_no = (model_prob_no - implied_prob_no) * 100
             min_edge = self.min_edge_pct
-            # Tighter edge OK for very cheap NO bets (high conviction far-OTM)
+
+            # Tiered edge requirements by NO price:
             if no_ask <= 25 and model_prob_no >= 0.90:
-                min_edge = max(3.0, self.min_edge_pct - 2.0)
-            elif model_prob_no >= 0.85 and mins_left <= 15:
-                min_edge = max(3.0, self.min_edge_pct - 2.0)
+                min_edge = max(5.0, self.min_edge_pct)       # cheap far-OTM: base edge OK
+            elif no_ask <= 50:
+                min_edge = max(min_edge, 15.0)                 # 30-50c: near-ATM, need 15% edge
+            elif no_ask <= 70:
+                min_edge = max(min_edge, 12.0)                 # 50-70c: moderate OTM, 12% edge
+            else:
+                min_edge = max(min_edge, 8.0)                  # 70c+: far OTM, 8% edge
 
-            # Skip ATM bracket for NO too — model is least accurate there
-            is_atm_no = (floor_s is not None and cap_s is not None
-                         and floor_s <= current_price < cap_s)
-            if is_atm_no:
-                return None  # skip ATM bracket entirely
+            # Also require high model confidence for NO bets
+            min_conf_no = 0.65  # must be 65%+ confident in NO
 
-            # NO on expensive near-ATM brackets (>30c) requires extra edge
-            if no_ask > 30:
-                min_edge = max(min_edge, 10.0)  # 10% minimum edge for expensive NO
-
-            if edge_no >= min_edge and model_prob_no >= self.min_confidence:
+            if edge_no >= min_edge and model_prob_no >= min_conf_no:
                 return {
                     'ticker': ticker, 'event': event, 'side': 'no',
                     'price': no_ask, 'model_prob': model_prob_no,
@@ -495,12 +569,18 @@ class WSConvergenceTrader:
 
         return None
 
-    def _book_depth_at(self, ticker: str, side: str, price_cents: int) -> int:
-        """Return quantity available at given price level in the orderbook."""
+    def _book_depth_at(self, ticker: str, side: str, ask_price_cents: int) -> int:
+        """Return quantity available at given ASK price.
+        
+        Since orderbook levels are BIDS, the depth at a YES ask comes from the
+        NO bid at (100 - ask_price) and vice versa.
+        """
         ob = self.orderbooks.get(ticker, {})
-        levels = ob.get(side, [])
+        counter_side = 'no' if side == 'yes' else 'yes'
+        counter_price = 100 - ask_price_cents
+        levels = ob.get(counter_side, [])
         for p, q in levels:
-            if p == price_cents:
+            if p == counter_price:
                 return q
         return 0
 
@@ -542,12 +622,26 @@ class WSConvergenceTrader:
         if self.event_trade_count.get(event, 0) >= self.max_trades_per_event:
             return False
 
+        # Check per-event exposure cap
+        event_exp = self.event_exposure.get(event, 0.0)
+        if event_exp >= self.max_exposure_per_event:
+            return False
+
         # Check total exposure cap
         qty = self.size_trade(opp, balance)
         if qty <= 0:
             return False
 
         cost = qty * opp['price'] / 100.0
+
+        # Trim to fit per-event exposure cap
+        event_remaining = self.max_exposure_per_event - event_exp
+        if cost > event_remaining:
+            qty = int(event_remaining / (opp['price'] / 100.0))
+            if qty <= 0:
+                return False
+            cost = qty * opp['price'] / 100.0
+
         if self.total_exposure + cost > self.max_total_exposure:
             remaining = self.max_total_exposure - self.total_exposure
             if remaining < 0.50:  # less than 50c headroom
@@ -583,6 +677,7 @@ class WSConvergenceTrader:
             self.paper_pnl += ev
             self.traded_tickers[trade_key] = time.time()
             self.event_trade_count[event] = self.event_trade_count.get(event, 0) + 1
+            self.event_exposure[event] = self.event_exposure.get(event, 0.0) + cost
             # Store for settlement tracking
             self.paper_trades.append({
                 'ticker': opp['ticker'], 'event': event, 'side': opp['side'],
@@ -599,9 +694,14 @@ class WSConvergenceTrader:
             try:
                 logger.info("   LIVE ORDER: %d %s @ %dc on %s",
                              qty, opp['side'].upper(), opp['price'], opp['ticker'])
+                # Set order expiration to 60 seconds from now
+                # This prevents orphan resting orders if the bot crashes
+                import time as _time
+                expiration_ts = int(_time.time()) + 60
                 order = self.api.place_order(
                     ticker=opp['ticker'], side=opp['side'],
-                    quantity=qty, price=opp['price']
+                    quantity=qty, price=opp['price'],
+                    expiration_ts=expiration_ts
                 )
                 if order:
                     order_id = order.get('order_id', '')
@@ -633,6 +733,7 @@ class WSConvergenceTrader:
 
                     self.traded_tickers[trade_key] = time.time()
                     self.event_trade_count[event] = self.event_trade_count.get(event, 0) + 1
+                    self.event_exposure[event] = self.event_exposure.get(event, 0.0) + cost
                     return True
                 else:
                     logger.warning("   ORDER FAILED")
@@ -689,6 +790,13 @@ class WSConvergenceTrader:
                 elif status == 'canceled' or status == 'cancelled':
                     logger.info("   ORDER CANCELLED: %s (external)", order_id[:8])
                     self.total_exposure -= info['cost']
+                    # Allow retry on this ticker
+                    trade_key = f"{info['ticker']}_{info['side']}"
+                    self.traded_tickers.pop(trade_key, None)
+                    evt = info.get('event', info['ticker'].rsplit('-', 1)[0]) if '-B' in info['ticker'] else ''
+                    if evt:
+                        self.event_trade_count[evt] = max(0, self.event_trade_count.get(evt, 1) - 1)
+                        self.event_exposure[evt] = max(0, self.event_exposure.get(evt, 0) - info['cost'])
                     to_remove.append(order_id)
 
                 elif status == 'resting' and age > self.order_timeout_secs:
@@ -708,8 +816,14 @@ class WSConvergenceTrader:
                         })
                         self.total_exposure += actual_cost - info['cost']
                     else:
-                        # No fills at all — release exposure
+                        # No fills at all — release exposure and allow retry
                         self.total_exposure -= info['cost']
+                        trade_key = f"{info['ticker']}_{info['side']}"
+                        self.traded_tickers.pop(trade_key, None)
+                        evt_ticker = info['ticker'].rsplit('-B', 1)[0] if '-B' in info['ticker'] else ''
+                        if evt_ticker:
+                            self.event_trade_count[evt_ticker] = max(0, self.event_trade_count.get(evt_ticker, 1) - 1)
+                            self.event_exposure[evt_ticker] = max(0, self.event_exposure.get(evt_ticker, 0) - info['cost'])
 
                     self._cancel_order(order_id, info, reason="timeout")
                     to_remove.append(order_id)
@@ -1007,6 +1121,10 @@ class WSConvergenceTrader:
 
     async def _session(self):
         """Single WS session: connect, subscribe, process messages."""
+        # ── Cancel any orphaned resting orders from prior sessions ──
+        logger.info("Cancelling any orphaned resting orders from prior sessions...")
+        self._cancel_all_resting_orders()
+
         # Settle any paper trades from events that expired before this session
         if self.config.PAPER_TRADING and self.paper_trades:
             # Get current active events from a fresh scan
@@ -1050,6 +1168,8 @@ class WSConvergenceTrader:
             updates_processed = 0
             opps_found = 0
             last_status = time.time()
+            last_heartbeat = time.time()
+            HEARTBEAT_INTERVAL = 120  # log heartbeat every 2 min
 
             async for raw_msg in ws:
                 data = json.loads(raw_msg)
@@ -1093,6 +1213,13 @@ class WSConvergenceTrader:
                 # Check pending orders for fills / timeouts
                 self._check_pending_orders()
 
+                # Heartbeat (every 2 min) — proves bot is alive even when no opps
+                now = time.time()
+                if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                    logger.info("HEARTBEAT pid=%d | %d updates since last HB | exposure=$%.2f | filled=%d",
+                                 os.getpid(), updates_processed, self.total_exposure, len(self.filled_orders))
+                    last_heartbeat = now
+
                 # Periodic status log (every 30s)
                 now = time.time()
                 if now - last_status >= 30:
@@ -1104,6 +1231,61 @@ class WSConvergenceTrader:
                                  pending_count, filled_count, self.trades_cancelled,
                                  self.total_exposure, self.paper_pnl,
                                  self.paper_settled_pnl, self.paper_wins, self.paper_wins + self.paper_losses)
+
+                    # Debug: sample a few tickers to see why no opps
+                    if opps_found == 0 and self.market_meta:
+                        no_liq_count = 0
+                        no_pass_edge = 0
+                        no_pass_conf = 0
+                        sample_count = 0
+                        for sample_tk in list(self.market_meta.keys()):
+                            meta_s = self.market_meta[sample_tk]
+                            asset_s = meta_s['asset']
+                            price_s = self.get_price(asset_s)
+                            if not price_s:
+                                continue
+                            mins_s = self._minutes_until(meta_s['close_time'])
+                            if mins_s is None or mins_s < self.min_expiry_minutes or mins_s > self.max_expiry_minutes:
+                                continue
+                            ob_s = self.orderbooks.get(sample_tk, {})
+                            # Derive NO ask from YES bids (orderbook levels are BIDS)
+                            yes_bids_s = ob_s.get('yes', [])
+                            td_s = self.ticker_data.get(sample_tk, {})
+                            # Prefer orderbook YES bid, fall back to ticker
+                            yb_s = max(p for p, q in yes_bids_s) if yes_bids_s else 0
+                            if not yb_s:
+                                yb_s = td_s.get('yes_bid', 0) or 0
+                            no_ask_s = (100 - yb_s) if yb_s > 0 else 0
+                            no_depth_s = 0
+                            if no_ask_s and yes_bids_s:
+                                for p, q in yes_bids_s:
+                                    if p == yb_s:
+                                        no_depth_s = q
+                            if no_ask_s >= 4 and no_depth_s >= self.min_book_depth:
+                                no_liq_count += 1
+                                fs = meta_s['floor_strike']
+                                cs = meta_s['cap_strike']
+                                iv_s = self.calibrated_vol.get(meta_s['event_ticker'])
+                                mp_s = self.bracket_probability(price_s, fs, cs, mins_s, asset_s, iv_s)
+                                mp_no = 1.0 - mp_s
+                                edge_s = (mp_no - no_ask_s / 100.0) * 100
+                                me = self.min_edge_pct
+                                if no_ask_s <= 25 and mp_no >= 0.90:
+                                    me = max(3.0, self.min_edge_pct - 2.0)
+                                if no_ask_s > 30:
+                                    me = max(me, 10.0)
+                                if edge_s >= me:
+                                    no_pass_edge += 1
+                                if mp_no >= self.min_confidence:
+                                    no_pass_conf += 1
+                                if sample_count < 5:
+                                    logger.info("  DEBUG %s: no=%dc d=%d mp_no=%.0f%% edge=%.1f%% me=%.1f%% conf=%s",
+                                                 sample_tk, no_ask_s, no_depth_s, mp_no*100, edge_s, me,
+                                                 'Y' if mp_no >= self.min_confidence else 'N')
+                                    sample_count += 1
+                        logger.info("  DEBUG summary: %d tickers w/NO liq, %d pass edge, %d pass confidence",
+                                     no_liq_count, no_pass_edge, no_pass_conf)
+
                     last_status = now
                     updates_processed = 0
                     opps_found = 0
@@ -1179,11 +1361,36 @@ def main():
     import sys
     import io
     import traceback
+    import atexit
+    from pathlib import Path
 
     # Fix Windows console encoding for emoji characters
     if sys.stdout.encoding != 'utf-8':
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+    # ── PID lock file to prevent multiple instances ──
+    LOCK_FILE = Path(__file__).parent / 'ws_trader.pid'
+    import os
+    import subprocess as _sp
+    if LOCK_FILE.exists():
+        old_pid = int(LOCK_FILE.read_text().strip())
+        # Windows-compatible check: use tasklist to see if the PID is a python process
+        try:
+            result = _sp.run(['tasklist', '/FI', f'PID eq {old_pid}', '/FO', 'CSV', '/NH'],
+                             capture_output=True, text=True, timeout=5)
+            if 'python' in result.stdout.lower():
+                print(f'FATAL: Another instance is already running (PID {old_pid}). Exiting.')
+                sys.exit(1)
+        except Exception:
+            pass  # can't check — assume dead, proceed
+    LOCK_FILE.write_text(str(os.getpid()))
+    def _remove_lock():
+        try:
+            LOCK_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+    atexit.register(_remove_lock)
 
     # Set up logging — use a custom FileHandler subclass that flushes every write
     class FlushFileHandler(logging.FileHandler):
