@@ -110,17 +110,19 @@ class WSConvergenceTrader:
         # Strategy params
         self.max_expiry_minutes = 60
         self.min_expiry_minutes = 2
-        self.min_confidence = 0.60               # Require 60%+ model confidence (ATM is ~50%, skip)
-        self.min_edge_pct = 8.0                   # Raised from 5% — need real edge, not noise
+        self.min_confidence = 0.55               # Lowered from 0.60 — 55% model confidence
+        self.min_edge_pct = 3.0                   # Lowered from 5% — capture small vol arb edges
         self.max_trade_usd = float(getattr(self.config, 'MAX_TRADE_USD', 20.0))
         self.max_contracts = 30                      # Reduced from 50 — limit single-trade exposure
-        self.min_price_cents = 15                  # Skip cheap orders (< 15c never fill on NO side)
-        self.max_yes_price_cents = 30              # NEW: don't buy YES above 30c (expensive YES loses)
-        self.min_book_depth = 5                    # Min contracts available at price level
-        self.atm_buffer_brackets = 1               # NEW: skip the ATM bracket (model worst there)
+        self.min_price_cents = 10                  # Lowered from 15 — see more bracket prices
+        self.max_yes_price_cents = 40              # Raised from 30c — allow more YES opportunities
+        self.min_book_depth = 3                    # Lowered from 5 — thin books OK
+        self.atm_buffer_brackets = 1               # Skip the ATM bracket (model worst there)
 
         # Vol estimates — raised 50% to reduce overconfidence on ATM brackets
-        self.base_vol = {'BTC': 0.0023, 'ETH': 0.0030, 'DOGE': 0.0045, 'XRP': 0.0038}
+        self.base_vol = {'BTC': 0.0023, 'ETH': 0.0030, 'DOGE': 0.0045, 'XRP': 0.0038, 'SOL': 0.0035}
+        # 15-minute binary up/down series
+        self._15m_series = ['KXBTC15M', 'KXETH15M', 'KXSOL15M', 'KXXRP15M']
         self.calibrated_vol: Dict[str, float] = {}  # {event_ticker: implied_vol}
 
         # WebSocket state
@@ -221,9 +223,9 @@ class WSConvergenceTrader:
                 return price
         return self._fetch_prices().get(asset)
 
-    _ASSETS = ['BTC', 'ETH', 'DOGE', 'XRP']
-    _COIN_IDS = 'bitcoin,ethereum,dogecoin,ripple'
-    _ASSET_MAP = [('BTC', 'bitcoin'), ('ETH', 'ethereum'), ('DOGE', 'dogecoin'), ('XRP', 'ripple')]
+    _ASSETS = ['BTC', 'ETH', 'DOGE', 'XRP', 'SOL']
+    _COIN_IDS = 'bitcoin,ethereum,dogecoin,ripple,solana'
+    _ASSET_MAP = [('BTC', 'bitcoin'), ('ETH', 'ethereum'), ('DOGE', 'dogecoin'), ('XRP', 'ripple'), ('SOL', 'solana')]
 
     def _fetch_prices(self) -> Dict[str, float]:
         now = time.time()
@@ -272,12 +274,12 @@ class WSConvergenceTrader:
         try:
             r = requests.get(
                 "https://min-api.cryptocompare.com/data/pricemulti",
-                params={'fsyms': 'BTC,ETH,DOGE,XRP', 'tsyms': 'USD'},
+                params={'fsyms': 'BTC,ETH,DOGE,XRP,SOL', 'tsyms': 'USD'},
                 timeout=5
             )
             r.raise_for_status()
             data = r.json()
-            cc_map = {'BTC': 'BTC', 'ETH': 'ETH', 'DOGE': 'DOGE', 'XRP': 'XRP'}
+            cc_map = {'BTC': 'BTC', 'ETH': 'ETH', 'DOGE': 'DOGE', 'XRP': 'XRP', 'SOL': 'SOL'}
             result = {}
             for asset, sym in cc_map.items():
                 p = data.get(sym, {}).get('USD')
@@ -299,6 +301,8 @@ class WSConvergenceTrader:
             return 'DOGE'
         if 'KXXRP' in ticker:
             return 'XRP'
+        if 'KXSOL' in ticker:
+            return 'SOL'
         return None
 
     @staticmethod
@@ -322,7 +326,7 @@ class WSConvergenceTrader:
 
     def scan_markets(self) -> List[str]:
         """
-        REST-scan for near-expiry crypto bracket markets.
+        REST-scan for near-expiry crypto bracket markets AND 15-min binary up/down.
         Returns list of market tickers to subscribe to via WebSocket.
         Rebuilds market_meta from scratch so expired events are dropped.
         """
@@ -338,6 +342,14 @@ class WSConvergenceTrader:
             return []
 
         all_markets = btc + eth + doge + xrp
+
+        # Also fetch 15-minute binary up/down markets
+        for series_15m in self._15m_series:
+            try:
+                m15 = self.api.get_all_markets(status="open", series_ticker=series_15m)
+                all_markets.extend(m15)
+            except Exception:
+                pass
         events: Dict[str, List[Dict]] = {}
         for m in all_markets:
             et = m.get('event_ticker', '')
@@ -404,14 +416,22 @@ class WSConvergenceTrader:
                 ticker = b.get('ticker', '')
                 if not ticker:
                     continue
+                # Detect binary up/down markets (no cap_strike, strike_type is 'greater' or 'greater_or_equal')
+                is_binary_updown = (b.get('cap_strike') is None
+                                    and b.get('floor_strike') is not None
+                                    and b.get('strike_type', '').startswith('greater'))
                 new_market_meta[ticker] = {
                     'floor_strike': b.get('floor_strike'),
                     'cap_strike': b.get('cap_strike'),
                     'event_ticker': event_ticker,
                     'close_time': ct,
                     'asset': asset,
+                    'market_type': 'binary_updown' if is_binary_updown else 'bracket',
                 }
                 tickers_to_sub.append(ticker)
+                if is_binary_updown:
+                    logger.info("15m binary: %s strike=%.2f, %s, %.0f min left",
+                                ticker, b.get('floor_strike', 0), asset, mins)
 
         # Replace market_meta entirely so expired events are dropped
         self.market_meta = new_market_meta
@@ -419,6 +439,114 @@ class WSConvergenceTrader:
         return tickers_to_sub
 
     # ─── Trade evaluation (called on each WS update) ─────────────────────
+
+    # ─── Binary up/down (15-min) evaluation ──────────────────────────────
+
+    def _evaluate_binary_updown(self, ticker: str, meta: dict,
+                                 current_price: float, mins_left: float) -> Optional[Dict]:
+        """Evaluate a 15-minute binary up/down market.
+
+        YES = price >= strike at expiry (price goes UP from open).
+        Model: P(up) = 1 - CDF(log(strike/price) / sigma) using base_vol.
+        """
+        asset = meta['asset']
+        strike = meta['floor_strike']
+        event = meta['event_ticker']
+
+        if not strike or strike <= 0:
+            return None
+
+        # Use base vol only — no IV calibration for binary markets
+        vol_15m = self.base_vol.get(asset, 0.002)
+        sigma = vol_15m * math.sqrt(mins_left / 15.0)
+        if sigma <= 0:
+            sigma = 0.0001
+
+        # P(price >= strike at expiry)
+        z = math.log(strike / current_price) / sigma
+        model_prob_yes = 1.0 - self._cdf(z)
+        model_prob_no = 1.0 - model_prob_yes
+
+        # ── Orderbook ──
+        td = self.ticker_data.get(ticker, {})
+        ob = self.orderbooks.get(ticker, {})
+
+        yes_bid = td.get('yes_bid', 0) or 0
+        yes_ask = td.get('yes_ask', 0) or 0
+        yes_bids = ob.get('yes', [])
+        no_bids = ob.get('no', [])
+
+        if yes_bids:
+            yes_bid = max(p for p, q in yes_bids)
+        if not yes_ask and no_bids:
+            best_no_bid = max(p for p, q in no_bids)
+            yes_ask = 100 - best_no_bid
+        no_ask = (100 - yes_bid) if yes_bid > 0 else 0
+
+        # Depth
+        yes_depth = 0
+        if yes_ask > 0 and no_bids:
+            matching = 100 - yes_ask
+            for p, q in no_bids:
+                if p == matching:
+                    yes_depth = q
+                    break
+        no_depth = 0
+        if yes_bid > 0 and yes_bids:
+            for p, q in yes_bids:
+                if p == yes_bid:
+                    no_depth = q
+                    break
+        # Fallback depth
+        if yes_depth == 0:
+            yes_depth = self.min_book_depth
+        if no_depth == 0:
+            no_depth = self.min_book_depth
+
+        # Edge thresholds for binary (simpler than bracket tiered edges)
+        binary_min_edge = 5.0    # 5% minimum edge (higher than bracket — model is noisier)
+        binary_max_edge = 25.0   # cap: edges > 25% are likely stale-price artifacts
+        binary_min_conf = 0.55   # 55% confidence
+
+        # ── Check YES opportunity (price going UP) ──
+        if (yes_ask >= self.min_price_cents and yes_ask <= 85
+                and yes_depth >= self.min_book_depth):
+            implied = yes_ask / 100.0
+            edge = (model_prob_yes - implied) * 100
+            if (edge >= binary_min_edge and edge <= binary_max_edge
+                    and model_prob_yes >= binary_min_conf):
+                return {
+                    'ticker': ticker, 'event': event, 'side': 'yes',
+                    'price': yes_ask, 'model_prob': model_prob_yes,
+                    'implied_prob': implied, 'edge_pct': edge,
+                    'minutes_left': mins_left, 'asset': asset,
+                    'current_price': current_price,
+                    'floor': strike, 'cap': None, 'impl_vol': vol_15m,
+                    'book_depth': yes_depth,
+                    'market_type': 'binary_updown',
+                }
+
+        # ── Check NO opportunity (price going DOWN) ──
+        if (no_ask >= self.min_price_cents and no_ask <= 85
+                and no_depth >= self.min_book_depth):
+            implied_no = no_ask / 100.0
+            edge_no = (model_prob_no - implied_no) * 100
+            if (edge_no >= binary_min_edge and edge_no <= binary_max_edge
+                    and model_prob_no >= binary_min_conf):
+                return {
+                    'ticker': ticker, 'event': event, 'side': 'no',
+                    'price': no_ask, 'model_prob': model_prob_no,
+                    'implied_prob': implied_no, 'edge_pct': edge_no,
+                    'minutes_left': mins_left, 'asset': asset,
+                    'current_price': current_price,
+                    'floor': strike, 'cap': None, 'impl_vol': vol_15m,
+                    'book_depth': no_depth,
+                    'market_type': 'binary_updown',
+                }
+
+        return None
+
+    # ─── Main evaluation dispatch ──────────────────────────────────────
 
     def evaluate_opportunity(self, ticker: str) -> Optional[Dict]:
         """
@@ -437,6 +565,10 @@ class WSConvergenceTrader:
         mins_left = self._minutes_until(meta['close_time'])
         if mins_left is None or mins_left < self.min_expiry_minutes or mins_left > self.max_expiry_minutes:
             return None
+
+        # ── Dispatch binary up/down markets to dedicated handler ──
+        if meta.get('market_type') == 'binary_updown':
+            return self._evaluate_binary_updown(ticker, meta, current_price, mins_left)
 
         floor_s = meta['floor_strike']
         cap_s = meta['cap_strike']
@@ -533,8 +665,8 @@ class WSConvergenceTrader:
             dist_to_bracket = min(abs(current_price - floor_s), abs(current_price - cap_s))
             if current_price >= floor_s and current_price < cap_s:
                 dist_to_bracket = 0  # price is IN the bracket
-            if dist_to_bracket < bracket_width * 2.0:
-                is_atm_no = True  # wider ATM buffer (2x bracket width)
+            if dist_to_bracket < bracket_width * 1.5:
+                is_atm_no = True  # ATM buffer (1.5x bracket width)
 
         if is_atm_no:
             pass  # Skip ATM/near-ATM NO trades entirely
@@ -545,16 +677,16 @@ class WSConvergenceTrader:
 
             # Tiered edge requirements by NO price:
             if no_ask <= 25 and model_prob_no >= 0.90:
-                min_edge = max(5.0, self.min_edge_pct)       # cheap far-OTM: base edge OK
+                min_edge = max(3.0, self.min_edge_pct)       # cheap far-OTM: base edge OK
             elif no_ask <= 50:
-                min_edge = max(min_edge, 15.0)                 # 30-50c: near-ATM, need 15% edge
+                min_edge = max(min_edge, 8.0)                  # 30-50c: near-ATM, need 8% edge
             elif no_ask <= 70:
-                min_edge = max(min_edge, 12.0)                 # 50-70c: moderate OTM, 12% edge
+                min_edge = max(min_edge, 6.0)                  # 50-70c: moderate OTM, 6% edge
             else:
-                min_edge = max(min_edge, 8.0)                  # 70c+: far OTM, 8% edge
+                min_edge = max(min_edge, 4.0)                  # 70c+: far OTM, 4% edge
 
             # Also require high model confidence for NO bets
-            min_conf_no = 0.65  # must be 65%+ confident in NO
+            min_conf_no = 0.60  # must be 60%+ confident in NO
 
             if edge_no >= min_edge and model_prob_no >= min_conf_no:
                 return {
@@ -1271,9 +1403,13 @@ class WSConvergenceTrader:
                                 edge_s = (mp_no - no_ask_s / 100.0) * 100
                                 me = self.min_edge_pct
                                 if no_ask_s <= 25 and mp_no >= 0.90:
-                                    me = max(3.0, self.min_edge_pct - 2.0)
-                                if no_ask_s > 30:
-                                    me = max(me, 10.0)
+                                    me = max(3.0, self.min_edge_pct)
+                                elif no_ask_s <= 50:
+                                    me = max(me, 8.0)
+                                elif no_ask_s <= 70:
+                                    me = max(me, 6.0)
+                                else:
+                                    me = max(me, 4.0)
                                 if edge_s >= me:
                                     no_pass_edge += 1
                                 if mp_no >= self.min_confidence:
