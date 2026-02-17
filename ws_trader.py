@@ -93,7 +93,7 @@ class WSConvergenceTrader:
         # Exposure tracking
         self.total_exposure = 0.0                # dollars currently at risk (cost of open positions)
         self.max_total_exposure = float(getattr(Config, 'MAX_EXPOSURE_USD', 250.0))
-        self.max_trades_per_event = 8            # cap trades per event to avoid order spam
+        self.max_trades_per_event = 5            # was 8 — reduce overtrading
         self.event_trade_count: Dict[str, int] = {}  # {event_ticker: count}
 
         # Paper settlement tracking
@@ -108,15 +108,17 @@ class WSConvergenceTrader:
         # Strategy params
         self.max_expiry_minutes = 60
         self.min_expiry_minutes = 2
-        self.min_confidence = 0.30
-        self.min_edge_pct = 2.0
+        self.min_confidence = 0.50               # was 0.30 — require higher model confidence
+        self.min_edge_pct = 5.0                   # was 2.0  — wider edge filter
         self.max_trade_usd = float(getattr(self.config, 'MAX_TRADE_USD', 20.0))
         self.max_contracts = 50
-        self.min_price_cents = 4       # Skip orders <= 3c (phantom liquidity)
-        self.min_book_depth = 5        # Min contracts available at price level
+        self.min_price_cents = 4                   # Skip orders <= 3c (phantom liquidity)
+        self.max_yes_price_cents = 30              # NEW: don't buy YES above 30c (expensive YES loses)
+        self.min_book_depth = 5                    # Min contracts available at price level
+        self.atm_buffer_brackets = 1               # NEW: skip the ATM bracket (model worst there)
 
-        # Vol estimates
-        self.base_vol = {'BTC': 0.0015, 'ETH': 0.0020, 'DOGE': 0.0030, 'XRP': 0.0025}
+        # Vol estimates — raised 50% to reduce overconfidence on ATM brackets
+        self.base_vol = {'BTC': 0.0023, 'ETH': 0.0030, 'DOGE': 0.0045, 'XRP': 0.0038}
         self.calibrated_vol: Dict[str, float] = {}  # {event_ticker: implied_vol}
 
         # WebSocket state
@@ -261,6 +263,18 @@ class WSConvergenceTrader:
         if 'KXXRP' in ticker:
             return 'XRP'
         return None
+
+    @staticmethod
+    def _fmt_price(p):
+        """Format a price for display — handles small coins like DOGE/XRP."""
+        if p is None:
+            return 'N/A'
+        if abs(p) < 1:
+            return f'{p:.6f}'
+        elif abs(p) < 100:
+            return f'{p:.4f}'
+        else:
+            return f'{p:,.0f}'
 
     def _minutes_until(self, close_time: str) -> Optional[float]:
         try:
@@ -419,16 +433,22 @@ class WSConvergenceTrader:
             if no_levels:
                 no_ask = min(p for p, q in no_levels)
 
-        # Check YES opportunity
+        # Check YES opportunity — only if price is affordable
         yes_depth = self._book_depth_at(ticker, 'yes', yes_ask) if yes_ask else 0
-        if yes_ask >= self.min_price_cents and yes_ask < 95 and yes_depth >= self.min_book_depth:
+        if (yes_ask >= self.min_price_cents and yes_ask <= self.max_yes_price_cents
+                and yes_depth >= self.min_book_depth):
             implied_prob = yes_ask / 100.0
             edge = (model_prob - implied_prob) * 100
             min_edge = self.min_edge_pct
             if model_prob >= 0.85 and mins_left <= 15:
-                min_edge = max(1.5, self.min_edge_pct - 1.5)
+                min_edge = max(3.0, self.min_edge_pct - 2.0)
 
-            if edge >= min_edge and model_prob >= self.min_confidence:
+            # Skip ATM bracket for YES — model is least accurate there
+            is_atm = (floor_s is not None and cap_s is not None
+                      and floor_s <= current_price < cap_s)
+            if is_atm:
+                pass  # skip ATM bracket entirely for YES
+            elif edge >= min_edge and model_prob >= self.min_confidence:
                 return {
                     'ticker': ticker, 'event': event, 'side': 'yes',
                     'price': yes_ask, 'model_prob': model_prob,
@@ -439,15 +459,28 @@ class WSConvergenceTrader:
                     'book_depth': yes_depth,
                 }
 
-        # Check NO opportunity
+        # Check NO opportunity — prefer cheap NO on far-OTM brackets
         model_prob_no = 1.0 - model_prob
         no_depth = self._book_depth_at(ticker, 'no', no_ask) if no_ask else 0
         if no_ask >= self.min_price_cents and no_ask < 95 and no_depth >= self.min_book_depth:
             implied_prob_no = no_ask / 100.0
             edge_no = (model_prob_no - implied_prob_no) * 100
             min_edge = self.min_edge_pct
-            if model_prob_no >= 0.85 and mins_left <= 15:
-                min_edge = max(1.5, self.min_edge_pct - 1.5)
+            # Tighter edge OK for very cheap NO bets (high conviction far-OTM)
+            if no_ask <= 25 and model_prob_no >= 0.90:
+                min_edge = max(3.0, self.min_edge_pct - 2.0)
+            elif model_prob_no >= 0.85 and mins_left <= 15:
+                min_edge = max(3.0, self.min_edge_pct - 2.0)
+
+            # Skip ATM bracket for NO too — model is least accurate there
+            is_atm_no = (floor_s is not None and cap_s is not None
+                         and floor_s <= current_price < cap_s)
+            if is_atm_no:
+                return None  # skip ATM bracket entirely
+
+            # NO on expensive near-ATM brackets (>30c) requires extra edge
+            if no_ask > 30:
+                min_edge = max(min_edge, 10.0)  # 10% minimum edge for expensive NO
 
             if edge_no >= min_edge and model_prob_no >= self.min_confidence:
                 return {
@@ -528,8 +561,8 @@ class WSConvergenceTrader:
         is_paper = self.config.PAPER_TRADING
         is_live = getattr(self.config, 'LIVE_TRADING_ENABLED', False)
 
-        floor_str = f"${opp['floor']:,.0f}" if opp['floor'] else "(-inf)"
-        cap_str = f"${opp['cap']:,.0f}" if opp['cap'] else "(+inf)"
+        floor_str = f"${self._fmt_price(opp['floor'])}" if opp['floor'] else "(-inf)"
+        cap_str = f"${self._fmt_price(opp['cap'])}" if opp['cap'] else "(+inf)"
 
         logger.info("")
         logger.info(">> %s  %s x%d @ %dc", opp['ticker'], opp['side'].upper(), qty, opp['price'])
@@ -537,7 +570,7 @@ class WSConvergenceTrader:
                      opp['model_prob'] * 100, opp['implied_prob'] * 100,
                      opp['edge_pct'], opp['minutes_left'])
         logger.info("   Bracket: %s — %s  |  %s @ $%s  |  Depth: %d",
-                     floor_str, cap_str, opp['asset'], f"{opp['current_price']:,.0f}",
+                     floor_str, cap_str, opp['asset'], self._fmt_price(opp['current_price']),
                      opp.get('book_depth', 0))
 
         self.trades_attempted += 1
@@ -763,15 +796,7 @@ class WSConvergenceTrader:
         event_wins = 0
         event_losses = 0
 
-        def _fmt_price(p):
-            if p is None:
-                return 'N/A'
-            if abs(p) < 1:
-                return f'{p:.6f}'
-            elif abs(p) < 100:
-                return f'{p:.4f}'
-            else:
-                return f'{p:,.0f}'
+        _fmt_price = self._fmt_price
 
         logger.info("")
         logger.info("=" * 60)
