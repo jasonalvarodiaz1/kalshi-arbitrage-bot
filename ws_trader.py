@@ -265,8 +265,10 @@ class WSConvergenceTrader:
         """
         REST-scan for near-expiry crypto bracket markets.
         Returns list of market tickers to subscribe to via WebSocket.
+        Rebuilds market_meta from scratch so expired events are dropped.
         """
         tickers_to_sub = []
+        new_market_meta = {}  # Rebuild from scratch — old events will disappear
         try:
             btc = self.api.get_all_markets(status="open", series_ticker="KXBTC")
             eth = self.api.get_all_markets(status="open", series_ticker="KXETH")
@@ -323,7 +325,7 @@ class WSConvergenceTrader:
                 ticker = b.get('ticker', '')
                 if not ticker:
                     continue
-                self.market_meta[ticker] = {
+                new_market_meta[ticker] = {
                     'floor_strike': b.get('floor_strike'),
                     'cap_strike': b.get('cap_strike'),
                     'event_ticker': event_ticker,
@@ -332,6 +334,8 @@ class WSConvergenceTrader:
                 }
                 tickers_to_sub.append(ticker)
 
+        # Replace market_meta entirely so expired events are dropped
+        self.market_meta = new_market_meta
         logger.info("Found %d tickers across qualifying events", len(tickers_to_sub))
         return tickers_to_sub
 
