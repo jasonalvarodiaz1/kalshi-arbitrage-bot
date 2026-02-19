@@ -2,7 +2,7 @@
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import re, sys
+import re
 sys.stdout.reconfigure(encoding='utf-8')
 
 edges_all = []
