@@ -107,6 +107,7 @@ class WSConvergenceTrader:
         self.max_event_pct = 0.05                    # 5% of bankroll per event
         self.stop_loss_pct = 0.15                    # 15% drawdown from starting equity → halt
         self.starting_balance = 171.18               # starting equity for drawdown tracking
+        self.stop_loss_triggered = False             # True after stop-loss fires; clears on recovery
 
         # Rule 5: CPPI — dynamic floor protection
         # Allocation = multiplier * (equity - floor)
@@ -1196,8 +1197,8 @@ class WSConvergenceTrader:
             return False
 
         # ── Rule 4: Stop-loss — halt if drawdown exceeds threshold ──
-        # Check current balance against starting balance
-        # (balance is passed from the main loop)
+        if self.stop_loss_triggered:
+            return False
 
         # Prevent trading opposite side on same bracket (guaranteed loss)
         opposite = 'no' if opp['side'] == 'yes' else 'yes'
@@ -1848,8 +1849,13 @@ class WSConvergenceTrader:
             except Exception:
                 balance = 250.0
             self.total_exposure = 0.0  # Reset exposure each session
+            # Set starting balance dynamically from current balance so stop-loss
+            # is measured relative to THIS session's starting equity, not a stale
+            # hardcoded value from a previous session.
+            if balance > 0:
+                self.starting_balance = balance
             # NOTE: Do NOT clear event_trade_count here — counters must persist across reconnects
-            logger.info("Balance: $%.2f | Max exposure: $%.2f", balance, self.max_total_exposure)
+            logger.info("Balance: $%.2f | Max exposure: $%.2f | Starting equity: $%.2f", balance, self.max_total_exposure, self.starting_balance)
 
             # Process messages
             updates_processed = 0
@@ -1937,7 +1943,9 @@ class WSConvergenceTrader:
                     cppi_floor = self.starting_balance * self.cppi_floor_pct
                     cppi_cushion = max(0, balance - cppi_floor)
                     cppi_max = self.cppi_multiplier * cppi_cushion
-                    drawdown_pct = ((self.starting_balance - balance) / self.starting_balance) * 100 if self.starting_balance > 0 else 0
+                    # Effective balance accounts for capital deployed in open live positions
+                    eff_bal_status = balance + self.total_exposure
+                    drawdown_pct = ((self.starting_balance - eff_bal_status) / self.starting_balance) * 100 if self.starting_balance > 0 else 0
                     logger.info("WS status: %d updates | %d opps | %d/%d trades (%d pending, %d filled, %d cancelled) | exposure=$%.2f | pnl=$%.2f | settled=$%.2f (%d/%d wins)",
                                  updates_processed, opps_found,
                                  self.trades_succeeded, self.trades_attempted,
@@ -2014,13 +2022,21 @@ class WSConvergenceTrader:
                     try:
                         balance = self.api.get_balance()
                         # ── Rule 4: Stop-loss check ──
-                        drawdown = (self.starting_balance - balance) / self.starting_balance
+                        # Use effective_balance = balance + total_exposure so that
+                        # capital deployed into open live positions is NOT counted as
+                        # a loss (Kalshi debits premium immediately on fill).
+                        effective_balance = balance + self.total_exposure
+                        drawdown = (self.starting_balance - effective_balance) / self.starting_balance
                         if drawdown >= self.stop_loss_pct:
-                            logger.warning("STOP-LOSS TRIGGERED: balance=$%.2f, drawdown=%.1f%% >= %.0f%% threshold. Halting trades.",
-                                           balance, drawdown * 100, self.stop_loss_pct * 100)
-                            # Don't break the loop — keep monitoring for settlements
-                            # But block new trades by setting exposure to max
-                            self.total_exposure = self.max_total_exposure
+                            if not self.stop_loss_triggered:
+                                logger.warning("STOP-LOSS TRIGGERED: balance=$%.2f, effective=$%.2f, drawdown=%.1f%% >= %.0f%% threshold. Halting trades.",
+                                               balance, effective_balance, drawdown * 100, self.stop_loss_pct * 100)
+                            self.stop_loss_triggered = True
+                        else:
+                            if self.stop_loss_triggered:
+                                logger.info("STOP-LOSS CLEARED: effective_balance=$%.2f, drawdown=%.1f%% — resuming trades.",
+                                            effective_balance, drawdown * 100)
+                            self.stop_loss_triggered = False
                     except Exception:
                         pass
 
