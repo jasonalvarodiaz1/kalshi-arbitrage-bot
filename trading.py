@@ -213,8 +213,8 @@ class KalshiTradingBot:
             if fresh_orderbook and isinstance(fresh_orderbook, dict):
                 fresh_yes_ask = None
                 fresh_no_ask = None
-                yes_asks = fresh_orderbook.get('yes', [])
-                no_asks = fresh_orderbook.get('no', [])
+                yes_asks = fresh_orderbook.get('yes_asks', [])
+                no_asks = fresh_orderbook.get('no_asks', [])
                 if yes_asks:
                     fresh_yes_ask = min(a[0] for a in yes_asks if len(a) >= 2)
                 if no_asks:
@@ -244,12 +244,15 @@ class KalshiTradingBot:
 
             yes_order_id = yes_order.get('order', {}).get('order_id') or yes_order.get('order_id')
             if not yes_order_id:
-                logger.warning("YES order succeeded but order_id not found in response. Cannot poll fill status.")
+                logger.critical(
+                    "YES order succeeded but order_id not found for %s. "
+                    "Cannot track or cancel fill. Aborting to prevent untracked exposure.",
+                    ticker
+                )
+                return False
 
             # Wait for YES order to fill
-            yes_fill = {'filled_qty': quantity, 'unfilled_qty': 0, 'status': 'filled', 'cancelled': False}
-            if yes_order_id:
-                yes_fill = self._wait_for_fill(yes_order_id, quantity)
+            yes_fill = self._wait_for_fill(yes_order_id, quantity)
 
             # Place NO order
             logger.info("Placing NO order: %s qty=%d price=%d¢", ticker, quantity, no_price)

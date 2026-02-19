@@ -104,8 +104,8 @@ class TestStalePrice(unittest.TestCase):
         """Aborts trade when fresh orderbook shows total >= 100¢."""
         # Fresh orderbook shows prices moved up — no longer profitable
         self.api.get_orderbook.return_value = {
-            'yes': [[52, 10]],
-            'no': [[52, 10]],
+            'yes_asks': [[52, 10]],
+            'no_asks': [[52, 10]],
         }
 
         opportunity = {
@@ -124,8 +124,8 @@ class TestStalePrice(unittest.TestCase):
     def test_proceeds_when_prices_still_profitable(self):
         """Continues with trade when fresh prices still sum < 100¢."""
         self.api.get_orderbook.return_value = {
-            'yes': [[44, 10]],
-            'no': [[50, 10]],
+            'yes_asks': [[44, 10]],
+            'no_asks': [[50, 10]],
         }
         self.api.place_order.side_effect = [
             {'order': {'order_id': 'y1', 'status': 'open'}},
