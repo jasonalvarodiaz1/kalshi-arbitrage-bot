@@ -93,10 +93,40 @@ class WSConvergenceTrader:
         # Exposure tracking
         self.total_exposure = 0.0                # dollars currently at risk (cost of open positions)
         self.max_total_exposure = float(getattr(Config, 'MAX_EXPOSURE_USD', 100.0))
-        self.max_trades_per_event = 3            # reduced from 5 — fewer trades per event
-        self.max_exposure_per_event = 30.0        # reduced from $50 — limit per-event risk
+        self.max_trades_per_event = 1            # STRICT: only 1 bracket per event — prevents adjacent losses
+        self.max_exposure_per_event = 15.0        # reduced — limit per-event risk
         self.event_trade_count: Dict[str, int] = {}  # {event_ticker: count}
         self.event_exposure: Dict[str, float] = {}   # {event_ticker: dollars}
+
+        # ── Risk Framework (5-rule system) ──────────────────────────────
+        # Rule 1: Thesis (Asset) exposure — crypto assets ARE the thesis
+        self.asset_exposure: Dict[str, float] = {}   # {asset: dollars}
+        self.max_asset_pct = 0.20                    # 20% of bankroll per asset (sector cap)
+
+        # Rule 4: Hard caps (% of bankroll, not fixed dollar amounts)
+        self.max_event_pct = 0.05                    # 5% of bankroll per event
+        self.stop_loss_pct = 0.15                    # 15% drawdown from starting equity → halt
+        self.starting_balance = 171.18               # starting equity for drawdown tracking
+
+        # Rule 5: CPPI — dynamic floor protection
+        # Allocation = multiplier * (equity - floor)
+        # When equity drops, max allocation shrinks automatically
+        self.cppi_multiplier = 3.0                   # aggressive=5, conservative=2
+        self.cppi_floor_pct = 0.70                   # protect 70% of starting capital
+
+        # ── Weather market configuration ────────────────────────────
+        self.weather_series = {
+            'KXHIGHLAX':  {'city': 'LAX',   'type': 'high', 'lat': 34.05,  'lon': -118.24, 'name': 'Los Angeles'},
+            'KXHIGHCHI':  {'city': 'CHI',   'type': 'high', 'lat': 41.88,  'lon': -87.63,  'name': 'Chicago'},
+            'KXHIGHDEN':  {'city': 'DEN',   'type': 'high', 'lat': 39.74,  'lon': -104.98, 'name': 'Denver'},
+            'KXHIGHTLV':  {'city': 'TLV',   'type': 'high', 'lat': 36.17,  'lon': -115.14, 'name': 'Las Vegas'},
+            'KXHIGHPHIL': {'city': 'PHIL',  'type': 'high', 'lat': 39.95,  'lon': -75.17,  'name': 'Philadelphia'},
+            'KXLOWTNYC':  {'city': 'NYC_L', 'type': 'low',  'lat': 40.71,  'lon': -74.01,  'name': 'New York City'},
+            'KXLOWTCHI':  {'city': 'CHI_L', 'type': 'low',  'lat': 41.88,  'lon': -87.63,  'name': 'Chicago'},
+        }
+        self.weather_forecast_cache: Dict[str, Dict] = {}  # {series: {temp, sigma, fetched_at, date}}
+        self.weather_forecast_ttl = 900  # refresh forecast every 15 min
+        self.weather_max_expiry_hours = 48  # allow weather markets up to 48h out
 
         # Paper settlement tracking
         self.paper_trades: List[Dict] = []       # all paper trades for settlement scoring
@@ -110,19 +140,21 @@ class WSConvergenceTrader:
         # Strategy params
         self.max_expiry_minutes = 60
         self.min_expiry_minutes = 2
-        self.min_confidence = 0.55               # Lowered from 0.60 — 55% model confidence
-        self.min_edge_pct = 3.0                   # Lowered from 5% — capture small vol arb edges
+        self.min_confidence = 0.60               # 60% model confidence minimum
+        self.min_edge_pct = 5.0                   # 5% minimum edge — below this is noise
         self.max_trade_usd = float(getattr(self.config, 'MAX_TRADE_USD', 20.0))
-        self.max_contracts = 30                      # Reduced from 50 — limit single-trade exposure
-        self.min_price_cents = 10                  # Lowered from 15 — see more bracket prices
-        self.max_yes_price_cents = 40              # Raised from 30c — allow more YES opportunities
-        self.min_book_depth = 3                    # Lowered from 5 — thin books OK
+        self.max_contracts = 15                      # Hard cap: 15 contracts per trade
+        self.min_price_cents = 10                  # Minimum price to consider
+        self.max_yes_price_cents = 30              # Max 30c for YES (risk/reward filter)
+        self.min_book_depth = 5                    # Need 5+ real depth — no thin books
         self.atm_buffer_brackets = 1               # Skip the ATM bracket (model worst there)
 
         # Vol estimates — raised 50% to reduce overconfidence on ATM brackets
         self.base_vol = {'BTC': 0.0023, 'ETH': 0.0030, 'DOGE': 0.0045, 'XRP': 0.0038, 'SOL': 0.0035}
         # 15-minute binary up/down series
         self._15m_series = ['KXBTC15M', 'KXETH15M', 'KXSOL15M', 'KXXRP15M']
+        # Weather forecast sigma: base_sigma * sqrt(hours_left / 6)
+        self.weather_base_sigma = 1.8  # °F base uncertainty at 6h out
         self.calibrated_vol: Dict[str, float] = {}  # {event_ticker: implied_vol}
 
         # WebSocket state
@@ -290,6 +322,137 @@ class WSConvergenceTrader:
         except Exception:
             return None
 
+    # ─── Weather forecast feed ───────────────────────────────────────────
+
+    def _fetch_weather_forecast(self, series_ticker: str) -> Optional[Dict]:
+        """Fetch temperature forecast from Open-Meteo for a weather series.
+        
+        Returns {forecast_temp: float, date: str, hours_left: float} or None.
+        Uses cache to avoid hitting the API too frequently.
+        """
+        now = time.time()
+        cached = self.weather_forecast_cache.get(series_ticker)
+        if cached and now - cached.get('fetched_at', 0) < self.weather_forecast_ttl:
+            return cached
+
+        ws = self.weather_series.get(series_ticker)
+        if not ws:
+            return None
+
+        try:
+            r = requests.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    'latitude': ws['lat'],
+                    'longitude': ws['lon'],
+                    'daily': 'temperature_2m_max,temperature_2m_min',
+                    'temperature_unit': 'fahrenheit',
+                    'timezone': 'America/New_York',
+                    'forecast_days': 3,
+                },
+                timeout=8
+            )
+            r.raise_for_status()
+            data = r.json()
+            daily = data.get('daily', {})
+            dates = daily.get('time', [])
+            highs = daily.get('temperature_2m_max', [])
+            lows = daily.get('temperature_2m_min', [])
+
+            if not dates:
+                return None
+
+            # Build forecasts for each date
+            forecasts = {}
+            for i, d in enumerate(dates):
+                forecasts[d] = {
+                    'high': highs[i] if i < len(highs) else None,
+                    'low': lows[i] if i < len(lows) else None,
+                }
+
+            result = {
+                'forecasts': forecasts,
+                'fetched_at': now,
+                'city': ws['city'],
+                'type': ws['type'],
+                'name': ws['name'],
+            }
+            self.weather_forecast_cache[series_ticker] = result
+            logger.info("Weather forecast for %s (%s): %s",
+                        series_ticker, ws['name'],
+                        {d: f"H={v['high']}F L={v['low']}F" for d, v in forecasts.items()})
+            return result
+        except Exception as e:
+            logger.warning("Failed to fetch weather forecast for %s: %s", series_ticker, e)
+            return cached  # return stale cache if available
+
+    def _get_weather_temp_and_sigma(self, series_ticker: str, event_date: str,
+                                     hours_left: float) -> Optional[tuple]:
+        """Get forecast temperature and uncertainty for a weather event.
+        
+        Returns (forecast_temp, sigma) or None.
+        """
+        forecast = self._fetch_weather_forecast(series_ticker)
+        if not forecast:
+            return None
+
+        ws = self.weather_series.get(series_ticker, {})
+        temp_type = ws.get('type', 'high')
+        forecasts = forecast.get('forecasts', {})
+
+        # Find the matching date in forecasts
+        temp = None
+        for d, vals in forecasts.items():
+            if event_date.startswith(d.replace('-', '')):
+                # Date format mismatch: event uses 26FEB19, forecast uses 2026-02-19
+                temp = vals.get(temp_type)
+                break
+
+        # Try matching by converting event_date format
+        if temp is None:
+            # event_date format: "26FEB19" → parse to yyyy-mm-dd
+            try:
+                from datetime import datetime as _dt
+                # Extract just the date part from event ticker (e.g., KXHIGHLAX-26FEB18 → 26FEB18)
+                parsed = _dt.strptime(event_date, '%y%b%d')
+                iso_date = parsed.strftime('%Y-%m-%d')
+                vals = forecasts.get(iso_date, {})
+                temp = vals.get(temp_type)
+            except (ValueError, TypeError):
+                pass
+
+        if temp is None:
+            return None
+
+        # Sigma scales with time: base_sigma * sqrt(hours_left / 6)
+        # At 6h out: sigma = base (1.8°F)
+        # At 24h out: sigma = 1.8 * 2 = 3.6°F
+        # At 48h out: sigma = 1.8 * 2.83 = 5.1°F
+        sigma = self.weather_base_sigma * math.sqrt(max(1, hours_left) / 6.0)
+        # Floor at 1.5°F — forecasts always have some error
+        sigma = max(1.5, sigma)
+
+        return (temp, sigma)
+
+    def weather_probability(self, forecast_temp: float, sigma: float,
+                             floor_s: Optional[float], cap_s: Optional[float],
+                             strike_type: str) -> float:
+        """P(temp lands in bracket) using Normal distribution around forecast.
+        
+        strike_type: 'between', 'less', 'greater'
+        """
+        if strike_type == 'between' and floor_s is not None and cap_s is not None:
+            z_cap = (cap_s - forecast_temp) / sigma
+            z_floor = (floor_s - forecast_temp) / sigma
+            return max(0.0, min(1.0, self._cdf(z_cap) - self._cdf(z_floor)))
+        elif strike_type == 'less' and cap_s is not None:
+            z = (cap_s - forecast_temp) / sigma
+            return max(0.0, min(1.0, self._cdf(z)))
+        elif strike_type.startswith('greater') and floor_s is not None:
+            z = (floor_s - forecast_temp) / sigma
+            return max(0.0, min(1.0, 1.0 - self._cdf(z)))
+        return 0.0
+
     # ─── REST market scanning ────────────────────────────────────────────
 
     def _parse_asset(self, ticker: str) -> Optional[str]:
@@ -416,6 +579,13 @@ class WSConvergenceTrader:
                 ticker = b.get('ticker', '')
                 if not ticker:
                     continue
+
+                # GUARD: skip markets with BOTH strikes missing (API returns
+                # incomplete data for newly-created markets — trading on
+                # null strikes gives model_prob=1.0 which is always wrong)
+                if b.get('floor_strike') is None and b.get('cap_strike') is None:
+                    continue
+
                 # Detect binary up/down markets (no cap_strike, strike_type is 'greater' or 'greater_or_equal')
                 is_binary_updown = (b.get('cap_strike') is None
                                     and b.get('floor_strike') is not None
@@ -435,7 +605,73 @@ class WSConvergenceTrader:
 
         # Replace market_meta entirely so expired events are dropped
         self.market_meta = new_market_meta
-        logger.info("Found %d tickers across qualifying events", len(tickers_to_sub))
+
+        # ── Weather market scanning ─────────────────────────────────────
+        weather_count = 0
+        for ws_series, ws_info in self.weather_series.items():
+            try:
+                w_markets = self.api.get_all_markets(status="open", series_ticker=ws_series)
+                if not w_markets:
+                    continue
+            except Exception:
+                continue
+
+            w_events: Dict[str, List[Dict]] = {}
+            for m in w_markets:
+                et = m.get('event_ticker', '')
+                w_events.setdefault(et, []).append(m)
+
+            for w_event, w_brackets in w_events.items():
+                ct = w_brackets[0].get('close_time', '')
+                mins = self._minutes_until(ct) if ct else None
+                if mins is None or mins < 60 or mins > self.weather_max_expiry_hours * 60:
+                    continue  # weather: skip < 1h or > 48h
+
+                # Extract event date from event_ticker: KXHIGHLAX-26FEB18 → 26FEB18
+                parts = w_event.split('-')
+                event_date = parts[-1] if len(parts) >= 2 else ''
+
+                for b in w_brackets:
+                    ticker = b.get('ticker', '')
+                    if not ticker:
+                        continue
+
+                    fs = b.get('floor_strike')
+                    cs = b.get('cap_strike')
+                    strike_type = b.get('strike_type', 'between')
+
+                    self.market_meta[ticker] = {
+                        'floor_strike': fs,
+                        'cap_strike': cs,
+                        'event_ticker': w_event,
+                        'close_time': ct,
+                        'asset': ws_info['city'],
+                        'market_type': 'weather',
+                        'weather_series': ws_series,
+                        'strike_type': strike_type,
+                        'event_date': event_date,
+                    }
+                    tickers_to_sub.append(ticker)
+                    weather_count += 1
+
+                    # Seed ticker_data from REST bid/ask (WS may not deliver updates for thin markets)
+                    yb = b.get('yes_bid', 0) or 0
+                    ya = b.get('yes_ask', 0) or 0
+                    if yb > 0 or ya > 0:
+                        if ticker not in self.ticker_data or not self.ticker_data[ticker].get('yes_bid'):
+                            self.ticker_data[ticker] = {
+                                'yes_bid': yb, 'yes_ask': ya,
+                                'price': b.get('price', 0), 'volume': b.get('volume', 0),
+                                'open_interest': b.get('open_interest', 0),
+                            }
+
+            # Pre-fetch forecast for this series
+            self._fetch_weather_forecast(ws_series)
+
+        if weather_count > 0:
+            logger.info("Weather: %d tickers across %d series", weather_count, len(self.weather_series))
+
+        logger.info("Found %d total tickers (crypto + weather)", len(tickers_to_sub))
         return tickers_to_sub
 
     # ─── Trade evaluation (called on each WS update) ─────────────────────
@@ -447,7 +683,20 @@ class WSConvergenceTrader:
         """Evaluate a 15-minute binary up/down market.
 
         YES = price >= strike at expiry (price goes UP from open).
-        Model: P(up) = 1 - CDF(log(strike/price) / sigma) using base_vol.
+
+        Strategy: Only trade when the CHEAP side (<35c) has a large model edge.
+        This gives favorable risk/reward: risk 35c to win 65c+.
+        We need a directional conviction + cheap price, not fair-value trades.
+
+        Key insight: our log-normal model has NO inherent edge vs market makers.
+        So we ONLY trade when:
+          1. The option is cheap (<35c) — limits downside
+          2. Model shows very high probability (>65%) — strong directional call
+          3. This means we're buying far-from-ATM: e.g. price is well
+             above strike → YES is expensive, NO is cheap → buy NO (contrarian)
+             OR price is well below strike → YES is cheap → buy YES
+          4. Implied vol reality check: skip if market vol >> our vol (market
+             sees more risk than we do)
         """
         asset = meta['asset']
         strike = meta['floor_strike']
@@ -456,8 +705,12 @@ class WSConvergenceTrader:
         if not strike or strike <= 0:
             return None
 
-        # Use base vol only — no IV calibration for binary markets
-        vol_15m = self.base_vol.get(asset, 0.002)
+        # Skip very short time — too noisy, mean reversion dominates
+        if mins_left < 3:
+            return None
+
+        # Use base vol — but inflate slightly for safety (model uncertainty)
+        vol_15m = self.base_vol.get(asset, 0.002) * 1.3  # 30% vol buffer
         sigma = vol_15m * math.sqrt(mins_left / 15.0)
         if sigma <= 0:
             sigma = 0.0001
@@ -483,6 +736,20 @@ class WSConvergenceTrader:
             yes_ask = 100 - best_no_bid
         no_ask = (100 - yes_bid) if yes_bid > 0 else 0
 
+        # ── Implied vol reality check ──
+        # If market mid-price diverges greatly from model, the market knows
+        # something we don't (higher vol, news, etc.) — skip.
+        if yes_ask > 0 and no_ask > 0:
+            mkt_mid = yes_ask / 100.0  # market's implied P(YES)
+            # If model and market disagree by >20% on the probability,
+            # AND the market is pricing closer to 50/50 than we are,
+            # the market likely has better vol info
+            if abs(model_prob_yes - mkt_mid) > 0.20:
+                # Check if market vol would be much higher than ours
+                # (market closer to 50/50 = higher vol)
+                if abs(mkt_mid - 0.5) < abs(model_prob_yes - 0.5):
+                    return None  # market thinks vol is higher — defer
+
         # Depth
         yes_depth = 0
         if yes_ask > 0 and no_bids:
@@ -497,20 +764,17 @@ class WSConvergenceTrader:
                 if p == yes_bid:
                     no_depth = q
                     break
-        # Fallback depth
-        if yes_depth == 0:
-            yes_depth = self.min_book_depth
-        if no_depth == 0:
-            no_depth = self.min_book_depth
 
-        # Edge thresholds for binary (simpler than bracket tiered edges)
-        binary_min_edge = 5.0    # 5% minimum edge (higher than bracket — model is noisier)
-        binary_max_edge = 25.0   # cap: edges > 25% are likely stale-price artifacts
-        binary_min_conf = 0.55   # 55% confidence
+        # ── Binary thresholds: MUCH stricter than bracket ──
+        binary_max_price = 35        # only buy cheap options (≤35c)
+        binary_min_edge = 10.0       # need 10%+ edge (model is noisy)
+        binary_max_edge = 30.0       # >30% is stale-price artifact
+        binary_min_conf = 0.65       # need 65%+ model confidence
+        binary_min_depth = 5         # need 5+ contracts depth
 
-        # ── Check YES opportunity (price going UP) ──
-        if (yes_ask >= self.min_price_cents and yes_ask <= 85
-                and yes_depth >= self.min_book_depth):
+        # ── Check YES opportunity (price going UP — only when cheap) ──
+        if (yes_ask >= self.min_price_cents and yes_ask <= binary_max_price
+                and yes_depth >= binary_min_depth):
             implied = yes_ask / 100.0
             edge = (model_prob_yes - implied) * 100
             if (edge >= binary_min_edge and edge <= binary_max_edge
@@ -526,9 +790,9 @@ class WSConvergenceTrader:
                     'market_type': 'binary_updown',
                 }
 
-        # ── Check NO opportunity (price going DOWN) ──
-        if (no_ask >= self.min_price_cents and no_ask <= 85
-                and no_depth >= self.min_book_depth):
+        # ── Check NO opportunity (price going DOWN — only when cheap) ──
+        if (no_ask >= self.min_price_cents and no_ask <= binary_max_price
+                and no_depth >= binary_min_depth):
             implied_no = no_ask / 100.0
             edge_no = (model_prob_no - implied_no) * 100
             if (edge_no >= binary_min_edge and edge_no <= binary_max_edge
@@ -546,6 +810,124 @@ class WSConvergenceTrader:
 
         return None
 
+    # ─── Weather bracket evaluation ─────────────────────────────────────
+
+    def _evaluate_weather(self, ticker: str, meta: dict,
+                           mins_left: float) -> Optional[Dict]:
+        """Evaluate a weather temperature bracket market.
+        
+        Uses Normal CDF around Open-Meteo forecast to find mispricings.
+        Weather markets have strike_type: 'between', 'less', 'greater'.
+        """
+        ws_series = meta.get('weather_series', '')
+        event = meta['event_ticker']
+        event_date = meta.get('event_date', '')
+        strike_type = meta.get('strike_type', 'between')
+        floor_s = meta['floor_strike']
+        cap_s = meta['cap_strike']
+
+        hours_left = mins_left / 60.0
+
+        # Get forecast temperature and uncertainty
+        ts_result = self._get_weather_temp_and_sigma(ws_series, event_date, hours_left)
+        if not ts_result:
+            return None
+        forecast_temp, sigma = ts_result
+
+        # Model probability
+        model_prob = self.weather_probability(forecast_temp, sigma, floor_s, cap_s, strike_type)
+
+        # Skip if model gives extreme probability (not useful for edge detection)
+        if model_prob < 0.02 or model_prob > 0.98:
+            return None
+
+        # ── Orderbook data ──
+        td = self.ticker_data.get(ticker, {})
+        ob = self.orderbooks.get(ticker, {})
+
+        yes_bid = td.get('yes_bid', 0) or 0
+        yes_ask = td.get('yes_ask', 0) or 0
+
+        # Enrich from orderbook if available
+        yes_bids = ob.get('yes', [])
+        no_bids = ob.get('no', [])
+
+        if yes_bids:
+            yes_bid = max(max(p for p, q in yes_bids), yes_bid)
+        if not yes_ask and no_bids:
+            best_no_bid = max(p for p, q in no_bids)
+            yes_ask = 100 - best_no_bid
+
+        no_ask = (100 - yes_bid) if yes_bid > 0 else 0
+
+        # Depth
+        no_depth = 0
+        if yes_bid > 0 and yes_bids:
+            for p, q in yes_bids:
+                if p == yes_bid:
+                    no_depth = q
+                    break
+        yes_depth = 0
+        if yes_ask > 0 and no_bids:
+            matching = 100 - yes_ask
+            for p, q in no_bids:
+                if p == matching:
+                    yes_depth = q
+                    break
+
+        # ── ATM buffer: skip bracket containing the forecast temp ──
+        is_atm = False
+        if strike_type == 'between' and floor_s is not None and cap_s is not None:
+            if floor_s <= forecast_temp < cap_s:
+                is_atm = True
+            # Also skip adjacent brackets (forecast ±1 bracket width)
+            bracket_width = cap_s - floor_s
+            if abs(forecast_temp - (floor_s + cap_s) / 2) < bracket_width * 1.5:
+                is_atm = True
+
+        if is_atm:
+            return None
+
+        model_prob_no = 1.0 - model_prob
+
+        # Check YES opportunity — buy YES if model says bracket is more likely than market
+        if (yes_ask >= 5 and yes_ask <= 40 and yes_depth >= 1):
+            implied_prob = yes_ask / 100.0
+            edge = (model_prob - implied_prob) * 100
+            if edge >= self.min_edge_pct and model_prob >= 0.55:
+                return {
+                    'ticker': ticker, 'event': event, 'side': 'yes',
+                    'price': yes_ask, 'model_prob': model_prob,
+                    'implied_prob': implied_prob, 'edge_pct': edge,
+                    'minutes_left': mins_left, 'asset': meta['asset'],
+                    'current_price': forecast_temp,
+                    'floor': floor_s, 'cap': cap_s, 'impl_vol': sigma,
+                    'book_depth': max(yes_depth, 1),
+                    'market_type': 'weather',
+                }
+
+        # Check NO opportunity — buy NO if model says bracket is unlikely
+        if (no_ask >= 5 and no_ask <= 85 and no_depth >= 1):
+            implied_no = no_ask / 100.0
+            edge_no = (model_prob_no - implied_no) * 100
+            min_edge = self.min_edge_pct
+            # Tiered: expensive NO needs more edge (nearer to forecast)
+            if no_ask > 60:
+                min_edge = max(min_edge, 8.0)
+            if edge_no >= min_edge and model_prob_no >= 0.55:
+                return {
+                    'ticker': ticker, 'event': event, 'side': 'no',
+                    'price': no_ask, 'model_prob': model_prob_no,
+                    'implied_prob': implied_no, 'edge_pct': edge_no,
+                    'minutes_left': mins_left, 'asset': meta['asset'],
+                    'current_price': forecast_temp,
+                    'floor': floor_s, 'cap': cap_s, 'impl_vol': sigma,
+                    'book_depth': max(no_depth, 1),
+                    'market_type': 'weather',
+                }
+
+        return None
+
     # ─── Main evaluation dispatch ──────────────────────────────────────
 
     def evaluate_opportunity(self, ticker: str) -> Optional[Dict]:
@@ -557,6 +939,15 @@ class WSConvergenceTrader:
         if not meta:
             return None
 
+        market_type = meta.get('market_type', 'bracket')
+
+        # ── Dispatch weather markets to dedicated handler ──
+        if market_type == 'weather':
+            mins_left = self._minutes_until(meta['close_time'])
+            if mins_left is None or mins_left < 60 or mins_left > self.weather_max_expiry_hours * 60:
+                return None
+            return self._evaluate_weather(ticker, meta, mins_left)
+
         asset = meta['asset']
         current_price = self.get_price(asset)
         if not current_price:
@@ -567,12 +958,19 @@ class WSConvergenceTrader:
             return None
 
         # ── Dispatch binary up/down markets to dedicated handler ──
-        if meta.get('market_type') == 'binary_updown':
+        if market_type == 'binary_updown':
             return self._evaluate_binary_updown(ticker, meta, current_price, mins_left)
 
         floor_s = meta['floor_strike']
         cap_s = meta['cap_strike']
         event = meta['event_ticker']
+
+        # GUARD: reject markets with both strikes missing — API may return
+        # incomplete data for newly-created markets. Without bounds,
+        # bracket_probability returns 1.0 which is meaningless.
+        if floor_s is None and cap_s is None:
+            return None
+
         impl_vol = self.calibrated_vol.get(event)
 
         model_prob = self.bracket_probability(current_price, floor_s, cap_s, mins_left, asset, impl_vol)
@@ -616,9 +1014,8 @@ class WSConvergenceTrader:
                 if p == yes_bid:
                     no_depth = q
                     break
-            # If no orderbook depth, use a default minimum
-            if no_depth == 0:
-                no_depth = self.min_book_depth  # ticker data implies existence
+            # NO DEPTH FALLBACK: if orderbook has no real depth, depth stays 0
+            # Previously we faked depth=min_book_depth which caused phantom fills
 
         # YES depth from NO bids at matching level
         yes_depth = 0
@@ -665,8 +1062,8 @@ class WSConvergenceTrader:
             dist_to_bracket = min(abs(current_price - floor_s), abs(current_price - cap_s))
             if current_price >= floor_s and current_price < cap_s:
                 dist_to_bracket = 0  # price is IN the bracket
-            if dist_to_bracket < bracket_width * 1.5:
-                is_atm_no = True  # ATM buffer (1.5x bracket width)
+            if dist_to_bracket < bracket_width * 2.0:
+                is_atm_no = True  # ATM buffer (2x bracket width) — model unreliable near ATM
 
         if is_atm_no:
             pass  # Skip ATM/near-ATM NO trades entirely
@@ -676,14 +1073,16 @@ class WSConvergenceTrader:
             min_edge = self.min_edge_pct
 
             # Tiered edge requirements by NO price:
-            if no_ask <= 25 and model_prob_no >= 0.90:
-                min_edge = max(3.0, self.min_edge_pct)       # cheap far-OTM: base edge OK
-            elif no_ask <= 50:
-                min_edge = max(min_edge, 8.0)                  # 30-50c: near-ATM, need 8% edge
-            elif no_ask <= 70:
-                min_edge = max(min_edge, 6.0)                  # 50-70c: moderate OTM, 6% edge
+            # CHEAP NO (<25c) = very far OTM = model confident = lower edge OK
+            # EXPENSIVE NO (>60c) = near ATM = model uncertain = need MORE edge
+            if no_ask <= 25 and model_prob_no >= 0.88:
+                min_edge = max(4.0, self.min_edge_pct)       # deep OTM: 4%+ edge if model is 88%+
+            elif no_ask <= 40:
+                min_edge = max(min_edge, 6.0)                  # moderate OTM: need 6%+ edge
+            elif no_ask <= 60:
+                min_edge = max(min_edge, 8.0)                  # near-ATM: need 8%+ edge
             else:
-                min_edge = max(min_edge, 4.0)                  # 70c+: far OTM, 4% edge
+                min_edge = max(min_edge, 10.0)                 # expensive NO (60c+): need 10%+ edge
 
             # Also require high model confidence for NO bets
             min_conf_no = 0.60  # must be 60%+ confident in NO
@@ -717,7 +1116,15 @@ class WSConvergenceTrader:
         return 0
 
     def size_trade(self, opp: Dict, balance: float) -> int:
-        """Half-Kelly position sizing."""
+        """Position sizing: Kelly/4 − liquidity penalty, with CPPI and hard caps.
+        
+        Framework:
+          1. Base Kelly fraction (quarter for binary, half for bracket)
+          2. Liquidity penalty: slash Kelly 50% if depth < 20
+          3. CPPI: cap total allocation to multiplier * (equity - floor)
+          4. Hard caps: 5% per event, 20% per asset
+          5. Slippage guard: won't take > 50% of book depth
+        """
         price_cents = opp['price']
         model_prob = opp['model_prob']
         cost = price_cents / 100.0
@@ -725,16 +1132,61 @@ class WSConvergenceTrader:
         if net_win <= 0 or cost <= 0:
             return 0
         kelly_mult = getattr(self.config, 'KELLY_MULTIPLIER', 0.5)
+
+        # Use quarter-Kelly for binary (model is unreliable)
+        is_binary = opp.get('market_type') == 'binary_updown'
+        if is_binary:
+            kelly_mult = kelly_mult * 0.5  # half of half-Kelly = quarter-Kelly
+
+        # ── Rule 2: Liquidity-adjusted sizing ──
+        # If book depth is thin, slash Kelly fraction to avoid slippage
+        book_depth = opp.get('book_depth', 0)
+        if book_depth < 20:
+            kelly_mult *= 0.5  # thin book → half the Kelly fraction
+
         b = net_win / cost
         f = ((b * model_prob) - (1 - model_prob)) / b
         f = max(0, f * kelly_mult)
-        risk = min(f * balance, self.max_trade_usd)
+
+        # ── Rule 5: CPPI floor protection ──
+        # Allocation = multiplier * (equity - floor)
+        cppi_floor = self.starting_balance * self.cppi_floor_pct
+        cushion = max(0, balance - cppi_floor)
+        cppi_max_alloc = self.cppi_multiplier * cushion
+        # CPPI caps the total dollars we can allocate to THIS trade
+        # If equity is near floor, cppi_max_alloc shrinks toward 0
+
+        max_trade = self.max_trade_usd
+        max_qty = self.max_contracts
+        if is_binary:
+            max_trade = min(max_trade, 5.0)   # max $5 per binary trade
+            max_qty = min(max_qty, 15)          # max 15 contracts per binary trade
+
+        # ── Rule 4: Hard cap — 5% of bankroll per event ──
+        event_cap = balance * self.max_event_pct
+        event_exp = self.event_exposure.get(opp.get('event', ''), 0.0)
+        event_remaining = max(0, event_cap - event_exp)
+
+        # ── Rule 1: Thesis cap — 20% of bankroll per asset ──
+        asset = opp.get('asset', '')
+        asset_cap = balance * self.max_asset_pct
+        asset_exp = self.asset_exposure.get(asset, 0.0)
+        asset_remaining = max(0, asset_cap - asset_exp)
+
+        # Apply all caps: Kelly, CPPI, max_trade, event cap, asset cap
+        risk = min(f * balance, max_trade, cppi_max_alloc, event_remaining, asset_remaining)
+        if risk <= 0:
+            return 0
+
         contracts = int(risk / cost)
-        contracts = min(max(0, contracts), self.max_contracts)
-        # Cap to available book depth
-        book_depth = opp.get('book_depth', contracts)
+        contracts = min(max(0, contracts), max_qty)
+
+        # ── Rule 2 continued: Slippage guard ──
+        # Never take more than 50% of visible book depth
         if book_depth > 0:
-            contracts = min(contracts, book_depth)
+            max_from_book = max(1, book_depth // 2)  # take at most half the book
+            contracts = min(contracts, max_from_book)
+
         return contracts
 
     def execute_trade(self, opp: Dict, balance: float) -> bool:
@@ -743,14 +1195,42 @@ class WSConvergenceTrader:
         if trade_key in self.traded_tickers:
             return False
 
+        # ── Rule 4: Stop-loss — halt if drawdown exceeds threshold ──
+        # Check current balance against starting balance
+        # (balance is passed from the main loop)
+
         # Prevent trading opposite side on same bracket (guaranteed loss)
         opposite = 'no' if opp['side'] == 'yes' else 'yes'
         opposite_key = f"{opp['ticker']}_{opposite}"
         if opposite_key in self.traded_tickers:
             return False
 
-        # Check per-event trade cap
+        # ── Prevent adjacent/nearby bracket trades within same event ──
+        # Trading NO on two nearby brackets guarantees one loss.
+        # STRICT: only 1 trade per event (max_trades_per_event=1), but also
+        # explicitly check bracket proximity as a safety net.
         event = opp.get('event', '')
+        opp_floor = opp.get('floor')
+        opp_cap = opp.get('cap')
+        if opp_floor is not None and opp_cap is not None:
+            bracket_width = opp_cap - opp_floor
+            for existing_key in self.traded_tickers:
+                existing_ticker = existing_key.rsplit('_', 1)[0]
+                existing_meta = self.market_meta.get(existing_ticker, {})
+                if existing_meta.get('event_ticker') != event:
+                    continue
+                ef = existing_meta.get('floor_strike')
+                ec = existing_meta.get('cap_strike')
+                if ef is None or ec is None:
+                    continue
+                # Block if brackets are within 4 bracket widths of each other
+                center_new = (opp_floor + opp_cap) / 2
+                center_existing = (ef + ec) / 2
+                distance = abs(center_new - center_existing)
+                if distance < bracket_width * 4:
+                    return False  # too close — risk of adjacent loss
+
+        # Check per-event trade cap
         if self.event_trade_count.get(event, 0) >= self.max_trades_per_event:
             return False
 
@@ -786,6 +1266,12 @@ class WSConvergenceTrader:
 
         is_paper = self.config.PAPER_TRADING
         is_live = getattr(self.config, 'LIVE_TRADING_ENABLED', False)
+        weather_live_only = getattr(self.config, 'WEATHER_LIVE_ONLY', True)
+
+        # Safety: if weather-only live mode, force paper for non-weather markets
+        if is_live and weather_live_only and opp.get('market_type') != 'weather':
+            is_paper = True
+            is_live = False
 
         floor_str = f"${self._fmt_price(opp['floor'])}" if opp['floor'] else "(-inf)"
         cap_str = f"${self._fmt_price(opp['cap'])}" if opp['cap'] else "(+inf)"
@@ -810,6 +1296,9 @@ class WSConvergenceTrader:
             self.traded_tickers[trade_key] = time.time()
             self.event_trade_count[event] = self.event_trade_count.get(event, 0) + 1
             self.event_exposure[event] = self.event_exposure.get(event, 0.0) + cost
+            # Rule 1: Track thesis (asset) exposure
+            asset = opp.get('asset', '')
+            self.asset_exposure[asset] = self.asset_exposure.get(asset, 0.0) + cost
             # Store for settlement tracking
             self.paper_trades.append({
                 'ticker': opp['ticker'], 'event': event, 'side': opp['side'],
@@ -818,6 +1307,7 @@ class WSConvergenceTrader:
                 'asset': opp['asset'], 'current_price': opp['current_price'],
                 'model_prob': opp['model_prob'], 'edge_pct': opp['edge_pct'],
                 'minutes_left': opp['minutes_left'],
+                'market_type': opp.get('market_type', 'bracket'),
                 'placed_at': datetime.now(timezone.utc).isoformat(),
             })
             return True
@@ -866,6 +1356,9 @@ class WSConvergenceTrader:
                     self.traded_tickers[trade_key] = time.time()
                     self.event_trade_count[event] = self.event_trade_count.get(event, 0) + 1
                     self.event_exposure[event] = self.event_exposure.get(event, 0.0) + cost
+                    # Rule 1: Track thesis (asset) exposure for live trades too
+                    asset = opp.get('asset', '')
+                    self.asset_exposure[asset] = self.asset_exposure.get(asset, 0.0) + cost
                     return True
                 else:
                     logger.warning("   ORDER FAILED")
@@ -1007,6 +1500,42 @@ class WSConvergenceTrader:
         except Exception as e:
             logger.error("   Sweep cancel error: %s", e)
 
+    def _load_existing_positions(self):
+        """Load existing positions from API to prevent duplicate trades after crash/restart.
+        
+        This is critical: without this, a bot crash clears traded_tickers and
+        event_trade_count, allowing the bot to re-trade adjacent brackets in
+        events where it already has positions.
+        """
+        try:
+            positions = self.api.get_positions()
+            loaded = 0
+            for p in positions:
+                ticker = p.get('market_ticker', p.get('ticker', ''))
+                pos = p.get('position', 0)
+                if pos == 0 or not ticker:
+                    continue
+                side = 'yes' if pos > 0 else 'no'
+                trade_key = f"{ticker}_{side}"
+                if trade_key not in self.traded_tickers:
+                    self.traded_tickers[trade_key] = time.time()
+                    loaded += 1
+                    # Also update event tracking
+                    # Extract event ticker from market ticker (e.g. KXBTC-26FEB1718-B67375 → KXBTC-26FEB1718)
+                    parts = ticker.split('-')
+                    if len(parts) >= 2:
+                        event = '-'.join(parts[:2])
+                        self.event_trade_count[event] = self.event_trade_count.get(event, 0) + 1
+                        cost_est = abs(pos) * (p.get('average_price', 50) / 100.0)
+                        self.event_exposure[event] = self.event_exposure.get(event, 0.0) + cost_est
+                        self.total_exposure += cost_est
+            if loaded > 0:
+                logger.info("Loaded %d existing positions into traded_tickers (crash protection)", loaded)
+            else:
+                logger.info("No existing positions to load")
+        except Exception as e:
+            logger.warning("Failed to load existing positions: %s", e)
+
     # ─── Paper Settlement Tracking ───────────────────────────────────────
 
     def _init_paper_results_file(self):
@@ -1021,7 +1550,7 @@ class WSConvergenceTrader:
                 ])
 
     def _settle_paper_trades(self, event_ticker: str):
-        """Settle all paper trades for an expired event using actual price."""
+        """Settle all paper trades for an expired event using actual price/temperature."""
         if event_ticker in self._settled_events:
             return
 
@@ -1031,10 +1560,22 @@ class WSConvergenceTrader:
             return
 
         asset = event_trades[0]['asset']
-        settle_price = self.get_price(asset)
-        if not settle_price:
-            logger.warning("Cannot settle %s — no price available for %s", event_ticker, asset)
-            return
+        is_weather = event_trades[0].get('market_type') == 'weather'
+
+        if is_weather:
+            # For weather: use the forecast temp as settlement proxy
+            # (actual observed temp not yet available — will be approximate)
+            settle_price = event_trades[0].get('current_price')
+            if not settle_price:
+                logger.warning("Cannot settle weather %s — no forecast temp", event_ticker)
+                return
+            settle_label = f"{settle_price:.0f}°F (forecast)"
+        else:
+            settle_price = self.get_price(asset)
+            if not settle_price:
+                logger.warning("Cannot settle %s — no price available for %s", event_ticker, asset)
+                return
+            settle_label = f"${self._fmt_price(settle_price)}"
 
         self._settled_events.add(event_ticker)
 
@@ -1046,7 +1587,7 @@ class WSConvergenceTrader:
 
         logger.info("")
         logger.info("=" * 60)
-        logger.info("SETTLEMENT: %s  |  %s @ $%s", event_ticker, asset, _fmt_price(settle_price))
+        logger.info("SETTLEMENT: %s  |  %s @ %s", event_ticker, asset, settle_label)
         logger.info("=" * 60)
 
         results_rows = []
@@ -1220,7 +1761,15 @@ class WSConvergenceTrader:
         """Main async event loop: connect WS, stream data, trade on updates."""
         is_paper = self.config.PAPER_TRADING
         is_live = getattr(self.config, 'LIVE_TRADING_ENABLED', False)
-        mode = "PAPER" if is_paper else ("LIVE" if is_live else "DRY-RUN")
+        weather_live_only = getattr(self.config, 'WEATHER_LIVE_ONLY', True)
+        if is_live and weather_live_only:
+            mode = "LIVE (weather only)"
+        elif is_paper:
+            mode = "PAPER"
+        elif is_live:
+            mode = "LIVE"
+        else:
+            mode = "DRY-RUN"
 
         logger.info("=" * 70)
         logger.info("WS CONVERGENCE TRADER — %s MODE", mode)
@@ -1238,6 +1787,9 @@ class WSConvergenceTrader:
         while self._running:
             try:
                 await self._session()
+                # Session ended normally (no-data timeout or no markets) — reconnect immediately
+                logger.info("Session ended — re-scanning markets immediately")
+                self._reconnect_delay = 1  # Reset backoff for normal exits
             except asyncio.CancelledError:
                 logger.info("WS trader cancelled — cleaning up orders...")
                 self._cancel_all_resting_orders()
@@ -1256,6 +1808,9 @@ class WSConvergenceTrader:
         # ── Cancel any orphaned resting orders from prior sessions ──
         logger.info("Cancelling any orphaned resting orders from prior sessions...")
         self._cancel_all_resting_orders()
+
+        # ── Load existing positions to prevent duplicate trades after crash/restart ──
+        self._load_existing_positions()
 
         # Settle any paper trades from events that expired before this session
         if self.config.PAPER_TRADING and self.paper_trades:
@@ -1301,46 +1856,67 @@ class WSConvergenceTrader:
             opps_found = 0
             last_status = time.time()
             last_heartbeat = time.time()
+            last_msg_time = time.time()
             HEARTBEAT_INTERVAL = 120  # log heartbeat every 2 min
+            WS_RECV_TIMEOUT = 30     # seconds — run housekeeping even with no messages
+            NO_DATA_TIMEOUT = 300    # 5 min with zero messages → force reconnect
 
-            async for raw_msg in ws:
-                data = json.loads(raw_msg)
-                msg_type = data.get('type', '')
+            while True:
+                # ── Receive next message with timeout ────────────────
+                try:
+                    raw_msg = await asyncio.wait_for(ws.recv(), timeout=WS_RECV_TIMEOUT)
+                except asyncio.TimeoutError:
+                    # No message in WS_RECV_TIMEOUT seconds — run housekeeping below
+                    raw_msg = None
+                except websockets.exceptions.ConnectionClosed:
+                    logger.warning("WebSocket connection closed — will reconnect")
+                    break
 
-                if msg_type == 'subscribed':
-                    sid = data.get('msg', {}).get('sid', '?')
-                    ch = data.get('msg', {}).get('channel', '?')
-                    logger.info("Confirmed subscription: channel=%s sid=%s", ch, sid)
+                # ── Process message if we got one ────────────────────
+                if raw_msg is not None:
+                    last_msg_time = time.time()
+                    data = json.loads(raw_msg)
+                    msg_type = data.get('type', '')
 
-                elif msg_type == 'orderbook_snapshot':
-                    self._handle_orderbook_snapshot(data.get('msg', {}))
-                    updates_processed += 1
+                    if msg_type == 'subscribed':
+                        sid = data.get('msg', {}).get('sid', '?')
+                        ch = data.get('msg', {}).get('channel', '?')
+                        logger.info("Confirmed subscription: channel=%s sid=%s", ch, sid)
 
-                elif msg_type == 'orderbook_delta':
-                    self._handle_orderbook_delta(data.get('msg', {}))
-                    updates_processed += 1
-                    # Evaluate on every delta
-                    ticker = data.get('msg', {}).get('market_ticker', '')
-                    if ticker:
-                        opp = self.evaluate_opportunity(ticker)
-                        if opp:
-                            opps_found += 1
-                            self.execute_trade(opp, balance)
+                    elif msg_type == 'orderbook_snapshot':
+                        self._handle_orderbook_snapshot(data.get('msg', {}))
+                        updates_processed += 1
 
-                elif msg_type == 'ticker':
-                    self._handle_ticker(data.get('msg', {}))
-                    updates_processed += 1
-                    # Also evaluate on ticker update
-                    ticker = data.get('msg', {}).get('market_ticker', '')
-                    if ticker:
-                        opp = self.evaluate_opportunity(ticker)
-                        if opp:
-                            opps_found += 1
-                            self.execute_trade(opp, balance)
+                    elif msg_type == 'orderbook_delta':
+                        self._handle_orderbook_delta(data.get('msg', {}))
+                        updates_processed += 1
+                        # Evaluate on every delta
+                        ticker = data.get('msg', {}).get('market_ticker', '')
+                        if ticker:
+                            opp = self.evaluate_opportunity(ticker)
+                            if opp:
+                                opps_found += 1
+                                self.execute_trade(opp, balance)
 
-                elif msg_type == 'error':
-                    err = data.get('msg', {})
-                    logger.warning("WS error: code=%s msg=%s", err.get('code'), err.get('msg'))
+                    elif msg_type == 'ticker':
+                        self._handle_ticker(data.get('msg', {}))
+                        updates_processed += 1
+                        # Also evaluate on ticker update
+                        ticker = data.get('msg', {}).get('market_ticker', '')
+                        if ticker:
+                            opp = self.evaluate_opportunity(ticker)
+                            if opp:
+                                opps_found += 1
+                                self.execute_trade(opp, balance)
+
+                    elif msg_type == 'error':
+                        err = data.get('msg', {})
+                        logger.warning("WS error: code=%s msg=%s", err.get('code'), err.get('msg'))
+
+                # ── No-data timeout → force reconnect to re-scan ─────
+                if time.time() - last_msg_time >= NO_DATA_TIMEOUT:
+                    logger.warning("No WS data for %ds — closing session to re-scan markets", NO_DATA_TIMEOUT)
+                    break
 
                 # Check pending orders for fills / timeouts
                 self._check_pending_orders()
@@ -1357,12 +1933,20 @@ class WSConvergenceTrader:
                 if now - last_status >= 30:
                     pending_count = len(self.pending_orders)
                     filled_count = len(self.filled_orders)
+                    # CPPI cushion info
+                    cppi_floor = self.starting_balance * self.cppi_floor_pct
+                    cppi_cushion = max(0, balance - cppi_floor)
+                    cppi_max = self.cppi_multiplier * cppi_cushion
+                    drawdown_pct = ((self.starting_balance - balance) / self.starting_balance) * 100 if self.starting_balance > 0 else 0
                     logger.info("WS status: %d updates | %d opps | %d/%d trades (%d pending, %d filled, %d cancelled) | exposure=$%.2f | pnl=$%.2f | settled=$%.2f (%d/%d wins)",
                                  updates_processed, opps_found,
                                  self.trades_succeeded, self.trades_attempted,
                                  pending_count, filled_count, self.trades_cancelled,
                                  self.total_exposure, self.paper_pnl,
                                  self.paper_settled_pnl, self.paper_wins, self.paper_wins + self.paper_losses)
+                    logger.info("  RISK: bal=$%.2f dd=%.1f%% cppi_max=$%.2f asset_exp=%s",
+                                 balance, drawdown_pct, cppi_max,
+                                 {k: round(v, 2) for k, v in self.asset_exposure.items()} if self.asset_exposure else '{}')
 
                     # Debug: sample a few tickers to see why no opps
                     if opps_found == 0 and self.market_meta:
@@ -1402,14 +1986,14 @@ class WSConvergenceTrader:
                                 mp_no = 1.0 - mp_s
                                 edge_s = (mp_no - no_ask_s / 100.0) * 100
                                 me = self.min_edge_pct
-                                if no_ask_s <= 25 and mp_no >= 0.90:
-                                    me = max(3.0, self.min_edge_pct)
-                                elif no_ask_s <= 50:
-                                    me = max(me, 8.0)
-                                elif no_ask_s <= 70:
+                                if no_ask_s <= 25 and mp_no >= 0.88:
+                                    me = max(4.0, self.min_edge_pct)
+                                elif no_ask_s <= 40:
                                     me = max(me, 6.0)
+                                elif no_ask_s <= 60:
+                                    me = max(me, 8.0)
                                 else:
-                                    me = max(me, 4.0)
+                                    me = max(me, 10.0)
                                 if edge_s >= me:
                                     no_pass_edge += 1
                                 if mp_no >= self.min_confidence:
@@ -1429,6 +2013,14 @@ class WSConvergenceTrader:
                     # Refresh balance
                     try:
                         balance = self.api.get_balance()
+                        # ── Rule 4: Stop-loss check ──
+                        drawdown = (self.starting_balance - balance) / self.starting_balance
+                        if drawdown >= self.stop_loss_pct:
+                            logger.warning("STOP-LOSS TRIGGERED: balance=$%.2f, drawdown=%.1f%% >= %.0f%% threshold. Halting trades.",
+                                           balance, drawdown * 100, self.stop_loss_pct * 100)
+                            # Don't break the loop — keep monitoring for settlements
+                            # But block new trades by setting exposure to max
+                            self.total_exposure = self.max_total_exposure
                     except Exception:
                         pass
 
@@ -1441,6 +2033,20 @@ class WSConvergenceTrader:
                     if unsub:
                         await self._subscribe(ws, unsub)
                         logger.info("Added %d new tickers from re-scan", len(unsub))
+
+                    # ── Periodic weather evaluation ──
+                    # Weather markets may get sparse WS updates, so evaluate
+                    # all weather tickers on each re-scan using REST bid/ask data
+                    weather_opps = 0
+                    for w_ticker, w_meta in self.market_meta.items():
+                        if w_meta.get('market_type') != 'weather':
+                            continue
+                        opp = self.evaluate_opportunity(w_ticker)
+                        if opp:
+                            weather_opps += 1
+                            self.execute_trade(opp, balance)
+                    if weather_opps > 0:
+                        logger.info("Weather scan found %d opportunities", weather_opps)
 
                     # Clean up traded_tickers and event_trade_count for OLD events only
                     # Never re-trade a ticker within the same active event

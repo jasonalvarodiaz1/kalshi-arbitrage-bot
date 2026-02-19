@@ -20,6 +20,7 @@ class Config:
     PAPER_TRADING = os.getenv('PAPER_TRADING', 'true').lower() == 'true'
     # Live trading safety
     LIVE_TRADING_ENABLED = os.getenv('ENABLE_LIVE_TRADING', 'false').lower() == 'true'
+    WEATHER_LIVE_ONLY = os.getenv('WEATHER_LIVE_ONLY', 'true').lower() == 'true'  # Only live-trade weather, paper everything else
     MAX_TRADE_USD = float(os.getenv('MAX_TRADE_USD', 100.0))
     
     # Notification Configuration
