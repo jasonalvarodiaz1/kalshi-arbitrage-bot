@@ -1,4 +1,7 @@
 """Deep dive into weather market structure and liquidity."""
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import sys, io, json
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 from kalshi_bot import KalshiAPI

@@ -1,4 +1,7 @@
 """Diagnostic: check 15-minute binary markets right now — prices, depth, model probs."""
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import sys, os, math
 sys.stdout.reconfigure(encoding='utf-8')
 
