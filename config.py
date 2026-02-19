@@ -53,6 +53,7 @@ class Config:
     BTC_15MIN_VOL = float(os.getenv('BTC_15MIN_VOL', 0.004))  # BTC 15-min realized vol (0.4%)
     ETH_15MIN_VOL = float(os.getenv('ETH_15MIN_VOL', 0.005))  # ETH 15-min realized vol (0.5%)
     PRICE_CACHE_SECONDS = int(os.getenv('PRICE_CACHE_SECONDS', 10))  # Price feed cache TTL
+    FILL_WAIT_TIMEOUT_SECONDS = int(os.getenv('FILL_WAIT_TIMEOUT_SECONDS', 30))
     
     @classmethod
     def validate(cls):
