@@ -1190,6 +1190,69 @@ class WSConvergenceTrader:
 
         return contracts
 
+    def _wait_for_fill(self, order_id: str, expected_qty: int, timeout: int = 30) -> Dict:
+        """Poll order status until fully filled or timeout, then cancel remainder.
+
+        Ported from the copilot/implement-partial-fill-monitoring PR.
+        Returns dict: {filled_qty, unfilled_qty, status, cancelled}
+        """
+        poll_interval = 2  # seconds between polls
+        elapsed = 0
+        filled_qty = 0
+        order_status = 'unknown'
+
+        while elapsed < timeout:
+            try:
+                order_info = self.api.get_order(order_id)
+            except Exception:
+                order_info = None
+
+            if order_info is None:
+                pass  # no response yet, keep polling
+            elif not isinstance(order_info, dict):
+                # unexpected response — assume filled to avoid false cancellations
+                logger.debug("_wait_for_fill %s: unexpected response type, assuming filled", order_id)
+                return {'filled_qty': expected_qty, 'unfilled_qty': 0,
+                        'status': 'filled', 'cancelled': False}
+            else:
+                order_data = order_info.get('order', order_info)
+                if not isinstance(order_data, dict):
+                    order_data = {}
+                order_status = order_data.get('status', 'unknown')
+                raw_filled = (order_data.get('filled_count') or
+                              order_data.get('fill_count') or
+                              order_data.get('quantity_filled') or 0)
+                filled_qty = int(raw_filled) if isinstance(raw_filled, (int, float)) else 0
+
+                logger.debug("_wait_for_fill %s: status=%s filled=%d/%d elapsed=%ds",
+                             order_id, order_status, filled_qty, expected_qty, elapsed)
+
+                if order_status in ('executed', 'filled', 'closed') or filled_qty >= expected_qty:
+                    return {'filled_qty': filled_qty,
+                            'unfilled_qty': max(0, expected_qty - filled_qty),
+                            'status': order_status, 'cancelled': False}
+
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+
+        # Timeout — cancel unfilled remainder
+        unfilled = max(0, expected_qty - filled_qty)
+        logger.warning("_wait_for_fill %s: timed out after %ds, filled=%d/%d — cancelling remainder",
+                       order_id, timeout, filled_qty, expected_qty)
+        cancelled = False
+        if unfilled > 0:
+            try:
+                cancelled = bool(self.api.cancel_order(order_id))
+                if cancelled:
+                    logger.info("   CANCELLED remainder of %s (%d contracts)", order_id[:8], unfilled)
+                else:
+                    logger.error("   CANCEL FAILED for %s — %d contracts may remain open", order_id[:8], unfilled)
+            except Exception as ce:
+                logger.error("   CANCEL ERROR for %s: %s", order_id[:8], ce)
+
+        return {'filled_qty': filled_qty, 'unfilled_qty': unfilled,
+                'status': order_status, 'cancelled': cancelled}
+
     def execute_trade(self, opp: Dict, balance: float) -> bool:
         """Execute a convergence trade (paper or live)."""
         trade_key = f"{opp['ticker']}_{opp['side']}"
@@ -1342,17 +1405,49 @@ class WSConvergenceTrader:
                             'cost': cost, 'filled_at': time.time(),
                         })
                     else:
-                        # Order is resting (maker order) — track it for polling
-                        logger.info("   RESTING: order_id=%s status=%s fill=%d/%d",
+                        # Order is resting — wait up to order_timeout_secs for a fill
+                        logger.info("   RESTING: order_id=%s status=%s fill=%d/%d — polling for fill...",
                                      order_id, status, fill_count, qty)
-                        self.pending_orders[order_id] = {
-                            'order_id': order_id, 'ticker': opp['ticker'],
-                            'side': opp['side'], 'qty': qty, 'price': opp['price'],
-                            'cost': cost, 'placed_at': time.time(),
-                            'fill_count': fill_count,
-                        }
-                        # Reserve exposure for pending order
-                        self.total_exposure += cost
+                        self.total_exposure += cost  # reserve exposure while waiting
+                        fill_result = self._wait_for_fill(order_id, expected_qty=qty,
+                                                          timeout=self.order_timeout_secs)
+                        actual_filled = fill_result['filled_qty']
+                        actual_cost = actual_filled * opp['price'] / 100.0
+
+                        if actual_filled >= qty:
+                            # Fully filled during wait
+                            logger.info("   FILLED (after wait): order_id=%s %d/%d contracts",
+                                         order_id, actual_filled, qty)
+                            self.trades_succeeded += 1
+                            self.filled_orders.append({
+                                'order_id': order_id, 'ticker': opp['ticker'],
+                                'side': opp['side'], 'qty': actual_filled,
+                                'price': opp['price'], 'cost': actual_cost,
+                                'filled_at': time.time(),
+                            })
+                            # Adjust exposure to actual cost (may differ if price slipped)
+                            self.total_exposure += actual_cost - cost
+                        elif actual_filled > 0:
+                            # Partial fill — record what we got, exposure already reserved
+                            logger.warning("   PARTIAL FILL: %d/%d contracts filled on %s",
+                                            actual_filled, qty, opp['ticker'])
+                            self.trades_succeeded += 1
+                            self.filled_orders.append({
+                                'order_id': order_id, 'ticker': opp['ticker'],
+                                'side': opp['side'], 'qty': actual_filled,
+                                'price': opp['price'], 'cost': actual_cost,
+                                'filled_at': time.time(),
+                            })
+                            # Release the unfilled portion of reserved exposure
+                            self.total_exposure -= (cost - actual_cost)
+                        else:
+                            # Zero fill — cancel and undo everything
+                            logger.warning("   NO FILL: order %s cancelled/timed out", order_id[:8])
+                            self.total_exposure -= cost
+                            self.traded_tickers.pop(trade_key, None)
+                            self.event_trade_count[event] = max(0, self.event_trade_count.get(event, 1) - 1)
+                            self.event_exposure[event] = max(0.0, self.event_exposure.get(event, 0.0) - cost)
+                            return False  # no fill = no trade
 
                     self.traded_tickers[trade_key] = time.time()
                     self.event_trade_count[event] = self.event_trade_count.get(event, 0) + 1
