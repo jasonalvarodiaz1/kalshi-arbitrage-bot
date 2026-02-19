@@ -46,6 +46,10 @@ Thumbs.db
 # Results/data
 paper_results.csv
 test_results.txt
+weather_results.txt
+
+# Runtime files
+ws_trader.pid
 
 # Database
 *.db
