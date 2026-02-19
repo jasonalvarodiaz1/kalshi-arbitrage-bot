@@ -1,3 +1,6 @@
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import sys, os, json, requests
 sys.stdout.reconfigure(encoding='utf-8')
 from kalshi_bot import KalshiAPI

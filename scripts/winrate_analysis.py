@@ -1,5 +1,8 @@
 """Analyze expected win rate at different edge thresholds from live log data."""
-import re, sys
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import re
 sys.stdout.reconfigure(encoding='utf-8')
 
 edges_all = []

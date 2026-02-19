@@ -1,4 +1,7 @@
 """Quick check of available events."""
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from kalshi_bot import KalshiAPI
 from config import Config
 from datetime import datetime, timezone

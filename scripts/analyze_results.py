@@ -1,4 +1,7 @@
 """Analyze paper trading results to identify winning/losing patterns."""
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import csv
 
 wins = losses = 0

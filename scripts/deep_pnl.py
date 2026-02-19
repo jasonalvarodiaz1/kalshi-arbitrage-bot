@@ -1,7 +1,7 @@
 """Deep P&L analysis - match every fill to its settlement."""
 import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.stdout.reconfigure(encoding='utf-8')
-sys.path.insert(0, os.path.dirname(__file__))
 from kalshi_bot import KalshiAPI
 from config import Config
 from urllib.parse import urlparse
