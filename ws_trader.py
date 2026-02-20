@@ -116,16 +116,20 @@ class WSConvergenceTrader:
         self.cppi_floor_pct = 0.70                   # protect 70% of starting capital
 
         # ── Weather market configuration ────────────────────────────
+        # Coordinates point to the exact NOAA observation stations Kalshi uses for settlement:
+        # LAX=Los Angeles Airport, MDW=Chicago Midway, DEN=Denver Airport,
+        # LAS=Las Vegas, PHL=Philadelphia Airport, LGA=NYC LaGuardia
         self.weather_series = {
-            'KXHIGHLAX':  {'city': 'LAX',   'type': 'high', 'lat': 34.05,  'lon': -118.24, 'name': 'Los Angeles'},
-            'KXHIGHCHI':  {'city': 'CHI',   'type': 'high', 'lat': 41.88,  'lon': -87.63,  'name': 'Chicago'},
-            'KXHIGHDEN':  {'city': 'DEN',   'type': 'high', 'lat': 39.74,  'lon': -104.98, 'name': 'Denver'},
-            'KXHIGHTLV':  {'city': 'TLV',   'type': 'high', 'lat': 36.17,  'lon': -115.14, 'name': 'Las Vegas'},
-            'KXHIGHPHIL': {'city': 'PHIL',  'type': 'high', 'lat': 39.95,  'lon': -75.17,  'name': 'Philadelphia'},
-            'KXLOWTNYC':  {'city': 'NYC_L', 'type': 'low',  'lat': 40.71,  'lon': -74.01,  'name': 'New York City'},
-            'KXLOWTCHI':  {'city': 'CHI_L', 'type': 'low',  'lat': 41.88,  'lon': -87.63,  'name': 'Chicago'},
+            'KXHIGHLAX':  {'city': 'LAX',   'type': 'high', 'lat': 33.9425, 'lon': -118.408,  'name': 'Los Angeles Airport', 'tz': 'America/Los_Angeles'},
+            'KXHIGHCHI':  {'city': 'MDW',   'type': 'high', 'lat': 41.7868, 'lon': -87.7522,  'name': 'Chicago Midway', 'tz': 'America/Chicago'},
+            'KXHIGHDEN':  {'city': 'DEN',   'type': 'high', 'lat': 39.8617, 'lon': -104.6731, 'name': 'Denver Airport', 'tz': 'America/Denver'},
+            'KXHIGHTLV':  {'city': 'LAS',   'type': 'high', 'lat': 36.0800, 'lon': -115.1522, 'name': 'Las Vegas', 'tz': 'America/Los_Angeles'},
+            'KXHIGHPHIL': {'city': 'PHL',   'type': 'high', 'lat': 39.8719, 'lon': -75.2411,  'name': 'Philadelphia Airport', 'tz': 'America/New_York'},
+            'KXLOWTNYC':  {'city': 'LGA',   'type': 'low',  'lat': 40.7773, 'lon': -73.8740,  'name': 'NYC LaGuardia', 'tz': 'America/New_York'},
+            'KXLOWTCHI':  {'city': 'MDW_L', 'type': 'low',  'lat': 41.7868, 'lon': -87.7522,  'name': 'Chicago Midway', 'tz': 'America/Chicago'},
         }
-        self.weather_forecast_cache: Dict[str, Dict] = {}  # {series: {temp, sigma, fetched_at, date}}
+        self.weather_forecast_cache: Dict[str, Dict] = {}  # {series: {forecasts, fetched_at, source, ...}}
+        self._nws_grid_cache: Dict[str, Dict] = {}          # {series: {gridId, gridX, gridY, forecastHourly}}
         self.weather_forecast_ttl = 900  # refresh forecast every 15 min
         self.weather_max_expiry_hours = 48  # allow weather markets up to 48h out
 
@@ -323,13 +327,45 @@ class WSConvergenceTrader:
         except Exception:
             return None
 
-    # ─── Weather forecast feed ───────────────────────────────────────────
+    # ─── Weather forecast feed (NWS primary, Open-Meteo fallback) ─────────
+
+    _NWS_HEADERS = {
+        'User-Agent': 'kalshi-weather-bot/1.0 (github.com/kalshi-bot)',
+        'Accept': 'application/geo+json',
+    }
+
+    def _get_nws_grid(self, series_ticker: str) -> Optional[Dict]:
+        """Resolve NWS gridpoint for a series (cached per session)."""
+        if series_ticker in self._nws_grid_cache:
+            return self._nws_grid_cache[series_ticker]
+        ws = self.weather_series.get(series_ticker)
+        if not ws:
+            return None
+        try:
+            r = requests.get(
+                f"https://api.weather.gov/points/{ws['lat']},{ws['lon']}",
+                headers=self._NWS_HEADERS, timeout=10,
+            )
+            r.raise_for_status()
+            p = r.json()['properties']
+            grid = {
+                'gridId': p['gridId'], 'gridX': p['gridX'], 'gridY': p['gridY'],
+                'tz': p['timeZone'], 'forecastHourly': p['forecastHourly'],
+            }
+            self._nws_grid_cache[series_ticker] = grid
+            logger.info("NWS grid %s: %s/%s,%s tz=%s",
+                        series_ticker, grid['gridId'], grid['gridX'], grid['gridY'], grid['tz'])
+            return grid
+        except Exception as e:
+            logger.warning("NWS grid lookup failed for %s: %s", series_ticker, e)
+            return None
 
     def _fetch_weather_forecast(self, series_ticker: str) -> Optional[Dict]:
-        """Fetch temperature forecast from Open-Meteo for a weather series.
-        
-        Returns {forecast_temp: float, date: str, hours_left: float} or None.
-        Uses cache to avoid hitting the API too frequently.
+        """Fetch NWS hourly forecast (official NOAA station data) for a weather series.
+
+        Falls back to Open-Meteo if NWS is unavailable.
+        NWS uses exact airport station coordinates that Kalshi settles against.
+        Returns {forecasts: {date_str: {high, low}}, fetched_at, source, ...} or None.
         """
         now = time.time()
         cached = self.weather_forecast_cache.get(series_ticker)
@@ -340,15 +376,56 @@ class WSConvergenceTrader:
         if not ws:
             return None
 
+        # Try NWS first — official source that Kalshi settles against
+        result = self._fetch_nws_hourly(series_ticker, ws, now)
+        if result:
+            return result
+
+        # Fallback to Open-Meteo
+        return self._fetch_openmeteo_forecast(series_ticker, ws, now)
+
+    def _fetch_nws_hourly(self, series_ticker: str, ws: Dict, now: float) -> Optional[Dict]:
+        """Fetch NWS hourly forecast and compute daily high/low per local date."""
+        grid = self._get_nws_grid(series_ticker)
+        if not grid:
+            return None
+        try:
+            r = requests.get(grid['forecastHourly'], headers=self._NWS_HEADERS, timeout=10)
+            r.raise_for_status()
+            periods = r.json()['properties']['periods']
+
+            # Group hourly temps by LOCAL calendar date
+            daily: Dict[str, list] = {}
+            for p in periods:
+                dt = datetime.fromisoformat(p['startTime'])
+                local_date = dt.strftime('%Y-%m-%d')
+                daily.setdefault(local_date, []).append(float(p['temperature']))
+
+            forecasts = {d: {'high': max(t), 'low': min(t)} for d, t in daily.items()}
+            result = {
+                'forecasts': forecasts, 'fetched_at': now,
+                'city': ws['city'], 'type': ws['type'], 'name': ws['name'],
+                'source': 'NWS',
+            }
+            self.weather_forecast_cache[series_ticker] = result
+            logger.info("NWS forecast %s (%s): %s", series_ticker, ws['name'],
+                        {d: f"H={v['high']}F L={v['low']}F" for d, v in list(forecasts.items())[:3]})
+            return result
+        except Exception as e:
+            logger.warning("NWS hourly fetch failed for %s: %s", series_ticker, e)
+            return None
+
+    def _fetch_openmeteo_forecast(self, series_ticker: str, ws: Dict, now: float) -> Optional[Dict]:
+        """Fallback weather forecast from Open-Meteo (gridded model, less accurate)."""
+        cached = self.weather_forecast_cache.get(series_ticker)
         try:
             r = requests.get(
                 "https://api.open-meteo.com/v1/forecast",
                 params={
-                    'latitude': ws['lat'],
-                    'longitude': ws['lon'],
+                    'latitude': ws['lat'], 'longitude': ws['lon'],
                     'daily': 'temperature_2m_max,temperature_2m_min',
                     'temperature_unit': 'fahrenheit',
-                    'timezone': 'America/New_York',
+                    'timezone': ws.get('tz', 'America/New_York'),
                     'forecast_days': 3,
                 },
                 timeout=8
@@ -359,33 +436,24 @@ class WSConvergenceTrader:
             dates = daily.get('time', [])
             highs = daily.get('temperature_2m_max', [])
             lows = daily.get('temperature_2m_min', [])
-
             if not dates:
-                return None
-
-            # Build forecasts for each date
-            forecasts = {}
-            for i, d in enumerate(dates):
-                forecasts[d] = {
-                    'high': highs[i] if i < len(highs) else None,
-                    'low': lows[i] if i < len(lows) else None,
-                }
-
+                return cached
+            forecasts = {d: {'high': highs[i] if i < len(highs) else None,
+                             'low': lows[i] if i < len(lows) else None}
+                         for i, d in enumerate(dates)}
             result = {
-                'forecasts': forecasts,
-                'fetched_at': now,
-                'city': ws['city'],
-                'type': ws['type'],
-                'name': ws['name'],
+                'forecasts': forecasts, 'fetched_at': now,
+                'city': ws['city'], 'type': ws['type'], 'name': ws['name'],
+                'source': 'OpenMeteo-fallback',
             }
             self.weather_forecast_cache[series_ticker] = result
-            logger.info("Weather forecast for %s (%s): %s",
-                        series_ticker, ws['name'],
-                        {d: f"H={v['high']}F L={v['low']}F" for d, v in forecasts.items()})
+            logger.warning("Open-Meteo FALLBACK for %s (%s): %s",
+                           series_ticker, ws['name'],
+                           {d: f"H={v['high']}F L={v['low']}F" for d, v in forecasts.items()})
             return result
         except Exception as e:
-            logger.warning("Failed to fetch weather forecast for %s: %s", series_ticker, e)
-            return cached  # return stale cache if available
+            logger.warning("Open-Meteo fallback failed for %s: %s", series_ticker, e)
+            return cached  # return stale if all else fails
 
     def _get_weather_temp_and_sigma(self, series_ticker: str, event_date: str,
                                      hours_left: float) -> Optional[tuple]:
