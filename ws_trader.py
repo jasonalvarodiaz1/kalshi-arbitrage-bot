@@ -496,38 +496,47 @@ class WSConvergenceTrader:
         """
         tickers_to_sub = []
         new_market_meta = {}  # Rebuild from scratch — old events will disappear
-        try:
-            btc = self.api.get_all_markets(status="open", series_ticker="KXBTC")
-            eth = self.api.get_all_markets(status="open", series_ticker="KXETH")
-            doge = self.api.get_all_markets(status="open", series_ticker="KXDOGE")
-            xrp = self.api.get_all_markets(status="open", series_ticker="KXXRP")
-        except Exception as e:
-            logger.error("REST scan failed: %s", e)
-            return []
+        disable_crypto = getattr(self.config, 'DISABLE_CRYPTO', False)
+
+        if not disable_crypto:
+            try:
+                btc = self.api.get_all_markets(status="open", series_ticker="KXBTC")
+                eth = self.api.get_all_markets(status="open", series_ticker="KXETH")
+                doge = self.api.get_all_markets(status="open", series_ticker="KXDOGE")
+                xrp = self.api.get_all_markets(status="open", series_ticker="KXXRP")
+            except Exception as e:
+                logger.error("REST scan failed: %s", e)
+                return []
+        else:
+            btc = eth = doge = xrp = []
 
         all_markets = btc + eth + doge + xrp
 
         # Also fetch 15-minute binary up/down markets
-        for series_15m in self._15m_series:
-            try:
-                m15 = self.api.get_all_markets(status="open", series_ticker=series_15m)
-                all_markets.extend(m15)
-            except Exception:
-                pass
+        if not disable_crypto:
+            for series_15m in self._15m_series:
+                try:
+                    m15 = self.api.get_all_markets(status="open", series_ticker=series_15m)
+                    all_markets.extend(m15)
+                except Exception:
+                    pass
         events: Dict[str, List[Dict]] = {}
         for m in all_markets:
             et = m.get('event_ticker', '')
             events.setdefault(et, []).append(m)
 
-        prices = {a: self.get_price(a) for a in self._ASSETS}
-        price_parts = []
-        for a in self._ASSETS:
-            p = prices.get(a)
-            if a in ('BTC', 'ETH'):
-                price_parts.append(f"{a}=${p:,.0f}" if p else f"{a}=$N/A")
-            else:
-                price_parts.append(f"{a}=${p:.4f}" if p else f"{a}=$N/A")
-        logger.info("Prices: %s", "  ".join(price_parts))
+        if not disable_crypto:
+            prices = {a: self.get_price(a) for a in self._ASSETS}
+            price_parts = []
+            for a in self._ASSETS:
+                p = prices.get(a)
+                if a in ('BTC', 'ETH'):
+                    price_parts.append(f"{a}=${p:,.0f}" if p else f"{a}=$N/A")
+                else:
+                    price_parts.append(f"{a}=${p:.4f}" if p else f"{a}=$N/A")
+            logger.info("Prices: %s", "  ".join(price_parts))
+        else:
+            prices = {}
 
         for event_ticker, brackets in events.items():
             ct = brackets[0].get('close_time', '')

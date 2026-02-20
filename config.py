@@ -21,6 +21,7 @@ class Config:
     # Live trading safety
     LIVE_TRADING_ENABLED = os.getenv('ENABLE_LIVE_TRADING', 'false').lower() == 'true'
     WEATHER_LIVE_ONLY = os.getenv('WEATHER_LIVE_ONLY', 'true').lower() == 'true'  # Only live-trade weather, paper everything else
+    DISABLE_CRYPTO = os.getenv('DISABLE_CRYPTO', 'false').lower() == 'true'  # Skip crypto scanning entirely
     MAX_TRADE_USD = float(os.getenv('MAX_TRADE_USD', 100.0))
     
     # Notification Configuration
