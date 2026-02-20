@@ -1718,75 +1718,80 @@ class WSConvergenceTrader:
                 writer = csv.writer(f)
                 writer.writerow([
                     'timestamp', 'event', 'ticker', 'asset', 'side', 'qty', 'price_cents',
-                    'cost', 'floor', 'cap', 'settle_price', 'won', 'payout', 'pnl',
+                    'cost', 'floor', 'cap', 'market_result', 'won', 'payout', 'pnl',
                     'model_prob', 'edge_pct', 'minutes_left',
                 ])
 
     def _settle_paper_trades(self, event_ticker: str):
-        """Settle all paper trades for an expired event using actual price/temperature."""
+        """Settle paper trades using the actual Kalshi market result from the REST API.
+
+        IMPORTANT: The previous implementation used the forecast temperature (or spot
+        price) recorded at trade-entry time as the settlement value.  This created a
+        circular bias: the model placed the bet because its forecast put the temp
+        outside the bracket, and then it evaluated the outcome against that SAME
+        forecast — so paper trades almost always appeared to win even when the
+        underlying prediction was wrong.
+
+        The fix: after the event expires, query GET /markets/{ticker} and read the
+        official ``result`` field ("yes" or "no") that Kalshi posts.  This is the
+        same source as real settlement, so paper performance now reflects reality.
+
+        Deferred settlement: if Kalshi hasn't posted results yet (result == null),
+        we return without marking the event settled so the next scan cycle retries.
+        """
         if event_ticker in self._settled_events:
             return
 
-        # Get trades for this event
         event_trades = [t for t in self.paper_trades if t['event'] == event_ticker]
         if not event_trades:
             return
 
-        asset = event_trades[0]['asset']
-        is_weather = event_trades[0].get('market_type') == 'weather'
+        # ── Query actual Kalshi market results ───────────────────────────
+        settled_results: Dict[str, str] = {}   # {ticker: 'yes' | 'no'}
+        unique_tickers = list({t['ticker'] for t in event_trades})
 
-        if is_weather:
-            # For weather: use the forecast temp as settlement proxy
-            # (actual observed temp not yet available — will be approximate)
-            settle_price = event_trades[0].get('current_price')
-            if not settle_price:
-                logger.warning("Cannot settle weather %s — no forecast temp", event_ticker)
-                return
-            settle_label = f"{settle_price:.0f}°F (forecast)"
-        else:
-            settle_price = self.get_price(asset)
-            if not settle_price:
-                logger.warning("Cannot settle %s — no price available for %s", event_ticker, asset)
-                return
-            settle_label = f"${self._fmt_price(settle_price)}"
+        for ticker in unique_tickers:
+            try:
+                mkt = self.api.get_market(ticker)
+                if mkt and mkt.get('result') in ('yes', 'no'):
+                    settled_results[ticker] = mkt['result']
+            except Exception as e:
+                logger.warning("Could not fetch result for %s: %s", ticker, e)
 
+        if not settled_results:
+            # Results not yet posted — defer; do NOT add to _settled_events so
+            # the next weather-scan cycle will retry automatically.
+            logger.info("Settlement deferred for %s — Kalshi results not yet posted", event_ticker)
+            return
+
+        # Mark settled now (even if only partial) to prevent infinite retries
         self._settled_events.add(event_ticker)
 
-        event_pnl = 0.0
-        event_wins = 0
+        event_pnl   = 0.0
+        event_wins  = 0
         event_losses = 0
-
-        _fmt_price = self._fmt_price
+        results_rows = []
 
         logger.info("")
         logger.info("=" * 60)
-        logger.info("SETTLEMENT: %s  |  %s @ %s", event_ticker, asset, settle_label)
+        logger.info("SETTLEMENT: %s  (actual Kalshi result)", event_ticker)
         logger.info("=" * 60)
 
-        results_rows = []
-
         for trade in event_trades:
-            floor_s = trade['floor']
-            cap_s = trade['cap']
-            side = trade['side']
-            qty = trade['qty']
-            cost = trade['cost']
+            ticker = trade['ticker']
+            side   = trade['side']
+            qty    = trade['qty']
+            cost   = trade['cost']
 
-            # Determine if price landed in this bracket
-            in_bracket = True
-            if floor_s is not None and settle_price < floor_s:
-                in_bracket = False
-            if cap_s is not None and settle_price >= cap_s:
-                in_bracket = False
+            actual_result = settled_results.get(ticker)
+            if actual_result is None:
+                logger.warning("  %s: result not available — excluded from P&L", ticker)
+                continue
 
-            # YES wins if price is in bracket, NO wins if price is NOT in bracket
-            if side == 'yes':
-                won = in_bracket
-            else:
-                won = not in_bracket
-
+            # Win: we bought the side that matches how the market resolved
+            won    = (side == actual_result)
             payout = qty * 1.0 if won else 0.0
-            pnl = payout - cost
+            pnl    = payout - cost
 
             event_pnl += pnl
             if won:
@@ -1794,36 +1799,37 @@ class WSConvergenceTrader:
             else:
                 event_losses += 1
 
-            floor_str = f"${_fmt_price(floor_s)}" if floor_s else "(-inf)"
-            cap_str = f"${_fmt_price(cap_s)}" if cap_s else "(+inf)"
-            result_str = "WIN" if won else "LOSS"
-
-            logger.info("  %s %s %s x%d @ %dc → %s  pnl=$%.2f  (bracket: %s—%s)",
-                         trade['ticker'], side.upper(), result_str,
-                         qty, trade['price'], f"${payout:.2f}", pnl,
-                         floor_str, cap_str)
+            result_str = "WIN " if won else "LOSS"
+            logger.info("  %s %s %s x%d @ %dc → $%.2f  pnl=$%.2f  (settled %s)",
+                         ticker, side.upper(), result_str,
+                         qty, trade['price'], payout, pnl,
+                         actual_result.upper())
 
             results_rows.append([
                 datetime.now(timezone.utc).isoformat(), event_ticker,
-                trade['ticker'], asset, side, qty, trade['price'],
-                f"{cost:.2f}", floor_s or '', cap_s or '', _fmt_price(settle_price),
+                ticker, trade.get('asset', ''), side, qty, trade['price'],
+                f"{cost:.2f}",
+                trade.get('floor', '') or '', trade.get('cap', '') or '',
+                actual_result,          # was: settle_price (forecast temp) — now actual result
                 won, f"{payout:.2f}", f"{pnl:.2f}",
                 f"{trade['model_prob']:.4f}", f"{trade['edge_pct']:.1f}",
                 f"{trade['minutes_left']:.0f}",
             ])
 
         self.paper_settled_pnl += event_pnl
-        self.paper_wins += event_wins
+        self.paper_wins   += event_wins
         self.paper_losses += event_losses
 
-        total_trades = event_wins + event_losses
-        win_rate = (event_wins / total_trades * 100) if total_trades > 0 else 0
+        total_settled   = event_wins + event_losses
+        win_rate        = (event_wins / total_settled * 100) if total_settled > 0 else 0
+        cum_total       = self.paper_wins + self.paper_losses
+        cum_win_rate    = (self.paper_wins / cum_total * 100) if cum_total > 0 else 0
 
         logger.info("-" * 60)
-        logger.info("  Event P&L: $%.2f  |  %d/%d wins (%.0f%%)", event_pnl, event_wins, total_trades, win_rate)
-        logger.info("  Cumulative settled P&L: $%.2f  |  %d/%d wins (%.0f%%)",
-                     self.paper_settled_pnl, self.paper_wins, self.paper_wins + self.paper_losses,
-                     (self.paper_wins / (self.paper_wins + self.paper_losses) * 100) if (self.paper_wins + self.paper_losses) > 0 else 0)
+        logger.info("  Event P&L: $%.2f  |  %d/%d wins (%.0f%%)",
+                     event_pnl, event_wins, total_settled, win_rate)
+        logger.info("  Session settled P&L: $%.2f  |  %d/%d wins (%.0f%%)",
+                     self.paper_settled_pnl, self.paper_wins, cum_total, cum_win_rate)
         logger.info("=" * 60)
         logger.info("")
 
@@ -1835,7 +1841,7 @@ class WSConvergenceTrader:
         except Exception as e:
             logger.error("Failed to write paper results: %s", e)
 
-        # Remove settled trades from the list
+        # Remove settled trades so they aren't double-counted on next session
         self.paper_trades = [t for t in self.paper_trades if t['event'] != event_ticker]
 
     # ─── WebSocket message handlers ──────────────────────────────────────
