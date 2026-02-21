@@ -131,7 +131,7 @@ class WSConvergenceTrader:
         self.weather_forecast_cache: Dict[str, Dict] = {}  # {series: {forecasts, fetched_at, source, ...}}
         self._nws_grid_cache: Dict[str, Dict] = {}          # {series: {gridId, gridX, gridY, forecastHourly}}
         self.weather_forecast_ttl = 900  # refresh forecast every 15 min
-        self.weather_max_expiry_hours = 12  # only trade weather within 12h of settlement — forecast error ~2°F vs 5°F at 48h
+        self.weather_max_expiry_hours = 18  # trade weather within 18h of settlement (sigma=5.5°F at 18h — still honest)
 
         # Paper settlement tracking
         self.paper_trades: List[Dict] = []       # all paper trades for settlement scoring
