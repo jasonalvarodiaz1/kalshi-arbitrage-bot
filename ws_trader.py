@@ -131,7 +131,7 @@ class WSConvergenceTrader:
         self.weather_forecast_cache: Dict[str, Dict] = {}  # {series: {forecasts, fetched_at, source, ...}}
         self._nws_grid_cache: Dict[str, Dict] = {}          # {series: {gridId, gridX, gridY, forecastHourly}}
         self.weather_forecast_ttl = 900  # refresh forecast every 15 min
-        self.weather_max_expiry_hours = 48  # allow weather markets up to 48h out
+        self.weather_max_expiry_hours = 12  # only trade weather within 12h of settlement — forecast error ~2°F vs 5°F at 48h
 
         # Paper settlement tracking
         self.paper_trades: List[Dict] = []       # all paper trades for settlement scoring
@@ -158,8 +158,15 @@ class WSConvergenceTrader:
         self.base_vol = {'BTC': 0.0023, 'ETH': 0.0030, 'DOGE': 0.0045, 'XRP': 0.0038, 'SOL': 0.0035}
         # 15-minute binary up/down series
         self._15m_series = ['KXBTC15M', 'KXETH15M', 'KXSOL15M', 'KXXRP15M']
+        # Weather-specific risk params (separate from crypto params — weather model less reliable)
+        self.weather_base_sigma = 3.5      # °F base uncertainty at 6h out — calibrated to NWS MAE ~3-4°F
+        self.weather_min_edge_pct = 15.0    # need 15% edge for weather (vs 5% for crypto)
+        self.weather_min_conf = 0.80        # 80% model confidence (vs 55% — weather is noisy)
+        self.weather_no_max_price = 65      # never pay > 65c for NO — risk/reward floor
+        self.weather_yes_max_price = 25     # max 25c for YES (risk-friendly side)
+        self.weather_max_contracts = 4      # hard cap 4 contracts per weather trade (~$2-3 max risk)
+        self.weather_atm_sigma_mult = 2.5   # skip bracket if center within 2.5σ of forecast
         # Weather forecast sigma: base_sigma * sqrt(hours_left / 6)
-        self.weather_base_sigma = 1.8  # °F base uncertainty at 6h out
         self.calibrated_vol: Dict[str, float] = {}  # {event_ticker: implied_vol}
 
         # WebSocket state
@@ -494,12 +501,12 @@ class WSConvergenceTrader:
             return None
 
         # Sigma scales with time: base_sigma * sqrt(hours_left / 6)
-        # At 6h out: sigma = base (1.8°F)
-        # At 24h out: sigma = 1.8 * 2 = 3.6°F
-        # At 48h out: sigma = 1.8 * 2.83 = 5.1°F
+        # At 6h out: sigma = 3.5°F (base — NWS 6h MAE ~2-3°F)
+        # At 12h out: sigma = 3.5 * 1.41 = 4.95°F
+        # At 24h out: sigma = 3.5 * 2 = 7.0°F (now unused — 12h max)
         sigma = self.weather_base_sigma * math.sqrt(max(1, hours_left) / 6.0)
-        # Floor at 1.5°F — forecasts always have some error
-        sigma = max(1.5, sigma)
+        # Floor at 2.5°F — even at 1h out, forecast always has residual error
+        sigma = max(2.5, sigma)
 
         return (temp, sigma)
 
@@ -953,15 +960,17 @@ class WSConvergenceTrader:
                     yes_depth = q
                     break
 
-        # ── ATM buffer: skip bracket containing the forecast temp ──
+        # ── ATM buffer: skip brackets close to the forecast temp ──
+        # Use a sigma-based buffer so the exclusion zone scales with model uncertainty.
+        # At sigma=3.5°F, 2.5σ = 8.75°F: only trade brackets far enough from forecast
+        # that the model has genuine conviction (not just a narrow Normal peak).
         is_atm = False
         if strike_type == 'between' and floor_s is not None and cap_s is not None:
-            if floor_s <= forecast_temp < cap_s:
+            bracket_center = (floor_s + cap_s) / 2.0
+            if floor_s <= forecast_temp < cap_s:   # literally contains the forecast
                 is_atm = True
-            # Also skip adjacent brackets (forecast ±1 bracket width)
-            bracket_width = cap_s - floor_s
-            if abs(forecast_temp - (floor_s + cap_s) / 2) < bracket_width * 1.5:
-                is_atm = True
+            elif abs(forecast_temp - bracket_center) < sigma * self.weather_atm_sigma_mult:
+                is_atm = True  # too close to forecast — model uncertainty too high here
 
         if is_atm:
             return None
@@ -969,10 +978,10 @@ class WSConvergenceTrader:
         model_prob_no = 1.0 - model_prob
 
         # Check YES opportunity — buy YES if model says bracket is more likely than market
-        if (yes_ask >= 5 and yes_ask <= 40 and yes_depth >= 1):
+        if (yes_ask >= 5 and yes_ask <= self.weather_yes_max_price and yes_depth >= 1):
             implied_prob = yes_ask / 100.0
             edge = (model_prob - implied_prob) * 100
-            if edge >= self.min_edge_pct and model_prob >= 0.55:
+            if edge >= self.weather_min_edge_pct and model_prob >= self.weather_min_conf:
                 return {
                     'ticker': ticker, 'event': event, 'side': 'yes',
                     'price': yes_ask, 'model_prob': model_prob,
@@ -985,14 +994,12 @@ class WSConvergenceTrader:
                 }
 
         # Check NO opportunity — buy NO if model says bracket is unlikely
-        if (no_ask >= 5 and no_ask <= 85 and no_depth >= 1):
+        # Cap at weather_no_max_price (65c): don't pay >65c NO — risking 65c to win 35c is
+        # only EV+ if win rate >65%, and our sigma is wide enough that edge this high is rare.
+        if (no_ask >= 5 and no_ask <= self.weather_no_max_price and no_depth >= 1):
             implied_no = no_ask / 100.0
             edge_no = (model_prob_no - implied_no) * 100
-            min_edge = self.min_edge_pct
-            # Tiered: expensive NO needs more edge (nearer to forecast)
-            if no_ask > 60:
-                min_edge = max(min_edge, 8.0)
-            if edge_no >= min_edge and model_prob_no >= 0.55:
+            if edge_no >= self.weather_min_edge_pct and model_prob_no >= self.weather_min_conf:
                 return {
                     'ticker': ticker, 'event': event, 'side': 'no',
                     'price': no_ask, 'model_prob': model_prob_no,
@@ -1239,6 +1246,11 @@ class WSConvergenceTrader:
         if is_binary:
             max_trade = min(max_trade, 5.0)   # max $5 per binary trade
             max_qty = min(max_qty, 15)          # max 15 contracts per binary trade
+        # Weather: hard size cap — model error is high, never bet more than a few dollars
+        is_weather = opp.get('market_type') == 'weather'
+        if is_weather:
+            max_trade = min(max_trade, 6.0)                     # max $6 per weather trade
+            max_qty = min(max_qty, self.weather_max_contracts)  # max 4 contracts
 
         # ── Rule 4: Hard cap — 5% of bankroll per event ──
         event_cap = balance * self.max_event_pct
