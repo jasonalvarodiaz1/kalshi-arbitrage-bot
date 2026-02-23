@@ -131,7 +131,7 @@ class WSConvergenceTrader:
         self.weather_forecast_cache: Dict[str, Dict] = {}  # {series: {forecasts, fetched_at, source, ...}}
         self._nws_grid_cache: Dict[str, Dict] = {}          # {series: {gridId, gridX, gridY, forecastHourly}}
         self.weather_forecast_ttl = 900  # refresh forecast every 15 min
-        self.weather_max_expiry_hours = 18  # trade weather within 18h of settlement (sigma=5.5°F at 18h — still honest)
+        self.weather_max_expiry_hours = 36  # trade weather up to 36h out (sigma=8.6°F at 36h, 2.5σ buffer=21°F)
 
         # Paper settlement tracking
         self.paper_trades: List[Dict] = []       # all paper trades for settlement scoring
@@ -165,7 +165,7 @@ class WSConvergenceTrader:
         self.weather_no_max_price = 65      # never pay > 65c for NO — risk/reward floor
         self.weather_yes_max_price = 25     # max 25c for YES (risk-friendly side)
         self.weather_max_contracts = 4      # hard cap 4 contracts per weather trade (~$2-3 max risk)
-        self.weather_atm_sigma_mult = 2.5   # skip bracket if center within 2.5σ of forecast
+        self.weather_atm_sigma_mult = 0.0   # disabled — confidence+edge filters are sufficient ATM guard
         # Weather forecast sigma: base_sigma * sqrt(hours_left / 6)
         self.calibrated_vol: Dict[str, float] = {}  # {event_ticker: implied_vol}
 
