@@ -412,8 +412,8 @@ class PolymarketSportsArbitrage:
     def scan_opportunities(self) -> List[Dict]:
         """Scan all Polymarket sports markets for arb opportunities."""
         logger.info("Fetching Polymarket markets for sports arb scan...")
-        markets = self.poly_api.get_all_markets()
-        logger.info("Polymarket: %d total markets fetched", len(markets))
+        markets = self.poly_api.get_markets_for_tag('sports', min_liquidity=50.0)
+        logger.info("Polymarket: %d liquid binary sports markets fetched", len(markets))
 
         sports_markets = [
             m for m in markets
@@ -442,6 +442,37 @@ class PolymarketSportsArbitrage:
 
             if not token_a_id or not token_b_id:
                 continue
+
+            # ── Fast pre-filter using free Gamma price data ──────────────────
+            # outcomePrices = JSON["YES_price","NO_price"] from the Gamma API.
+            # If YES_price + NO_price ≥ 0.97 there is no room for a ≥2% arb
+            # after Polymarket's 2% winner fee.  Skip without any orderbook call.
+            outcome_prices_raw = market.get('outcomePrices')
+            if outcome_prices_raw:
+                try:
+                    import json as _json
+                    ops = _json.loads(outcome_prices_raw) if isinstance(outcome_prices_raw, str) else outcome_prices_raw
+                    if len(ops) == 2:
+                        yes_p = float(ops[0])
+                        no_p  = float(ops[1])
+                        if (yes_p + no_p) >= 0.97:
+                            continue  # No arb possible — sum too close to $1
+                except (ValueError, TypeError, Exception):
+                    pass
+            else:
+                # Fall back to bestAsk/bestBid heuristic if outcomePrices is absent
+                best_ask = market.get('bestAsk')
+                best_bid = market.get('bestBid')
+                if best_ask is not None and best_bid is not None:
+                    try:
+                        ba, bb = float(best_ask), float(best_bid)
+                        if ba <= 0 or ba >= 0.98:
+                            continue
+                        if (ba + (1.0 - bb)) >= 0.97:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+            # ─────────────────────────────────────────────────────────────────
 
             try:
                 ob_a = self.poly_api.get_orderbook(token_a_id)
@@ -617,3 +648,26 @@ class PolymarketSportsArbitrage:
             logger.info(
                 "Polymarket sports arb scanner stopped after %d iterations", iteration
             )
+
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Polymarket same-platform sports arbitrage scanner')
+    parser.add_argument('--once', action='store_true', help='Run a single scan and exit')
+    parser.add_argument('--interval', type=int, default=60, help='Seconds between scans (default 60)')
+    args = parser.parse_args()
+
+    Config.print_config()
+    scanner = PolymarketSportsArbitrage()
+
+    if args.once:
+        opps = scanner.scan_opportunities()
+        if not opps:
+            print('\nNo Polymarket sports arb opportunities found.')
+        else:
+            print(f'\nFound {len(opps)} opportunit{"y" if len(opps)==1 else "ies"}:')
+            for o in opps:
+                print(f"  [{o['arb_side'].upper()}] {o['market_title']} | profit={o['profit_cents']}c ({o['profit_percent']:.2f}%)")
+    else:
+        scanner.scan_continuous(interval=args.interval)

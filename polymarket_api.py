@@ -8,6 +8,7 @@ from typing import Dict, List, Optional
 logger = logging.getLogger('kalshi_bot')
 
 BASE_URL = "https://clob.polymarket.com"
+GAMMA_URL = "https://gamma-api.polymarket.com"
 _RATE_LIMIT_DELAY = 0.6  # ~100 req/min → 1 request per 0.6 s
 
 
@@ -158,12 +159,125 @@ class PolymarketAPI:
             logger.error("Error fetching Polymarket markets: %s", exc)
             return [], None
 
-    def get_all_markets(self) -> List[Dict]:
-        """Fetch ALL active Polymarket markets (handles pagination)."""
+    def get_events_by_tag(self, tag: str, limit: int = 100, max_pages: int = 20) -> List[Dict]:
+        """Fetch active Polymarket events filtered by tag using the Gamma API.
+
+        The ``/events?tag=<tag>`` endpoint actually filters properly.
+        Returns raw event dicts (each with a ``markets`` list inside).
+        Common tags: ``'sports'``, ``'politics'``, ``'crypto'``.
+        """
+        all_events: List[Dict] = []
+        offset = 0
+        page = 0
+        while page < max_pages:
+            page += 1
+            try:
+                params = {
+                    'tag': tag,
+                    'active': 'true',
+                    'closed': 'false',
+                    'limit': limit,
+                    'offset': offset,
+                }
+                resp = self._request_with_retry('GET', f"{GAMMA_URL}/events", params=params)
+                if resp is None or resp.status_code != 200:
+                    logger.error(
+                        "Gamma /events?tag=%s failed (status=%s)",
+                        tag, resp.status_code if resp else 'None',
+                    )
+                    break
+                data = resp.json()
+                page_events = data if isinstance(data, list) else data.get('data', [])
+                if not page_events:
+                    break
+                all_events.extend(page_events)
+                if len(page_events) < limit:
+                    break  # last page
+                offset += limit
+                time.sleep(_RATE_LIMIT_DELAY)
+            except Exception as exc:
+                logger.error("Error fetching Gamma events tag=%s: %s", tag, exc)
+                break
+        logger.info("Gamma API: fetched %d events for tag '%s'", len(all_events), tag)
+        return all_events
+
+    def get_markets_for_tag(self, tag: str, min_liquidity: float = 25.0) -> List[Dict]:
+        """Fetch active binary markets for a Gamma tag, normalized for the scanner.
+
+        Extracts markets from events (``/events?tag=<tag>``), normalises the
+        Gamma-format ``clobTokenIds`` into the CLOB-style ``tokens`` list, and
+        pre-filters by ``min_liquidity``.  The returned dicts also carry the
+        convenience fields ``bestBid``, ``bestAsk``, and ``liquidity`` so
+        the caller can do a cheap pre-filter before calling ``get_orderbook()``.
+        """
+        import json as _json
+        events = self.get_events_by_tag(tag)
+        markets: List[Dict] = []
+        for event in events:
+            for m in event.get('markets', []):
+                if not m.get('active') or m.get('closed'):
+                    continue
+                # clobTokenIds may arrive as a JSON-encoded string or a Python list
+                raw_ids = m.get('clobTokenIds', [])
+                if isinstance(raw_ids, str):
+                    try:
+                        token_ids = _json.loads(raw_ids)
+                    except Exception:
+                        continue
+                else:
+                    token_ids = raw_ids
+                if not isinstance(token_ids, list) or len(token_ids) != 2:
+                    continue  # only binary markets
+                # outcomes may also be a JSON string
+                outcomes_raw = m.get('outcomes', '["Yes","No"]')
+                try:
+                    outcomes = _json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+                except Exception:
+                    outcomes = ['Yes', 'No']
+                # Attach normalised tokens list
+                m['tokens'] = [
+                    {'token_id': token_ids[i], 'outcome': outcomes[i] if i < len(outcomes) else str(i)}
+                    for i in range(2)
+                ]
+                # Convert price strings → floats if needed
+                for field in ('bestBid', 'bestAsk', 'lastTradePrice'):
+                    val = m.get(field)
+                    if isinstance(val, str):
+                        try:
+                            m[field] = float(val)
+                        except ValueError:
+                            m[field] = None
+                # liquidity can be a string like "1234.56" or a float
+                liq_raw = m.get('liquidityNum') or m.get('liquidity', 0)
+                try:
+                    liq = float(liq_raw) if liq_raw else 0.0
+                except (ValueError, TypeError):
+                    liq = 0.0
+                if liq < min_liquidity:
+                    continue
+                markets.append(m)
+        logger.info(
+            "get_markets_for_tag('%s'): %d binary markets (liq>$%.0f) from %d events",
+            tag, len(markets), min_liquidity, len(events),
+        )
+        return markets
+
+    def get_markets_by_tag(self, tag_slug: str, limit: int = 100) -> List[Dict]:
+        """Alias for ``get_markets_for_tag`` (kept for backwards compatibility)."""
+        return self.get_markets_for_tag(tag_slug)
+
+    def get_all_markets(self, tag_slug: Optional[str] = None, max_pages: int = 50) -> List[Dict]:
+        """Fetch active Polymarket markets (handles pagination).
+
+        If ``tag_slug`` is provided, uses the faster Gamma API tag filter.
+        Otherwise falls back to the CLOB API (capped at ``max_pages``).
+        """
+        if tag_slug:
+            return self.get_markets_by_tag(tag_slug)
         all_markets: List[Dict] = []
         cursor = None
         page = 0
-        while True:
+        while page < max_pages:
             page += 1
             markets, cursor = self.get_markets(next_cursor=cursor)
             all_markets.extend(markets)
