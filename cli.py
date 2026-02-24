@@ -48,8 +48,10 @@ def main():
     print("8. Continuous auto-trading scanner 🤖 (finds & executes arbitrage)")
     print("9. Scan crypto markets for probability edge (BTC/ETH interval markets)")
     print("10. Auto-trade crypto probability strategy (continuous loop)")
+    print("11. Scan for cross-platform arbitrage (Kalshi ↔ Polymarket)")
+    print("12. Continuous cross-platform arbitrage scanner")
     
-    choice = input("\nEnter choice (1-10): ").strip()
+    choice = input("\nEnter choice (1-12): ").strip()
     
     if choice == "1":
         opportunities = bot.scan_all_markets_concurrent()
@@ -418,6 +420,49 @@ def main():
                 storage.close()
                 logger.info("Storage flushed and closed.")
     
+    elif choice == "11":
+        # Scan for cross-platform arbitrage (Kalshi ↔ Polymarket)
+        from cross_platform_arb import CrossPlatformArbitrage
+
+        print("\n" + "="*60)
+        print("🌐 CROSS-PLATFORM ARBITRAGE SCANNER (Kalshi ↔ Polymarket)")
+        print("="*60)
+        print(f"Min profit: {Config.CROSS_PLATFORM_MIN_PROFIT_PERCENT}%")
+        print(f"Similarity threshold: {Config.MATCH_SIMILARITY_THRESHOLD}")
+        print("="*60 + "\n")
+
+        scanner = CrossPlatformArbitrage(api, storage=storage)
+        opportunities = scanner.scan_opportunities()
+
+        if opportunities:
+            print(f"\n✅ Found {len(opportunities)} cross-platform opportunities:\n")
+            for i, opp in enumerate(opportunities, 1):
+                print(f"{i}. {opp['kalshi_ticker']} ↔ Polymarket")
+                print(f"   Kalshi: {opp['kalshi_title'][:60]}")
+                print(f"   Polymarket: {opp['poly_title'][:60]}")
+                print(f"   Match confidence: {opp['match_confidence']:.2%}")
+                print(f"   Strategy: {opp['strategy']}")
+                print(f"   Profit: {opp['profit_cents']}¢ ({opp['profit_percent']:.2f}%)")
+                print()
+        else:
+            print("\n📊 No cross-platform arbitrage opportunities found")
+
+    elif choice == "12":
+        # Continuous cross-platform arbitrage scanner
+        from cross_platform_arb import CrossPlatformArbitrage
+
+        print("\n" + "="*60)
+        print("🌐 CONTINUOUS CROSS-PLATFORM ARBITRAGE SCANNER")
+        print("="*60)
+        print(f"Scan interval: {Config.SCAN_INTERVAL_SECONDS}s")
+        print(f"Min profit: {Config.CROSS_PLATFORM_MIN_PROFIT_PERCENT}%")
+        print(f"Similarity threshold: {Config.MATCH_SIMILARITY_THRESHOLD}")
+        print(f"Press Ctrl+C to stop")
+        print("="*60 + "\n")
+
+        scanner = CrossPlatformArbitrage(api, storage=storage)
+        scanner.scan_continuous(interval=Config.SCAN_INTERVAL_SECONDS)
+
     else:
         print("Invalid choice")
 

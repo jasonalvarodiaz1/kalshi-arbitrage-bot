@@ -48,6 +48,15 @@ class Config:
     BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
     RATE_LIMIT_DELAY = 0.3  # Seconds between requests
     
+    # Polymarket Configuration
+    POLYMARKET_API_KEY = os.getenv('POLYMARKET_API_KEY')
+    POLYMARKET_PRIVATE_KEY = os.getenv('POLYMARKET_PRIVATE_KEY')
+    POLYMARKET_ENABLED = os.getenv('POLYMARKET_ENABLED', 'true').lower() == 'true'
+
+    # Cross-platform arbitrage
+    CROSS_PLATFORM_MIN_PROFIT_PERCENT = float(os.getenv('CROSS_PLATFORM_MIN_PROFIT_PERCENT', 2.0))
+    MATCH_SIMILARITY_THRESHOLD = float(os.getenv('MATCH_SIMILARITY_THRESHOLD', 0.85))
+
     # Probability Trading
     MIN_EDGE_PERCENT = float(os.getenv('MIN_EDGE_PERCENT', 3.0))  # Minimum edge to trade
     KELLY_MULTIPLIER = float(os.getenv('KELLY_MULTIPLIER', 0.5))  # Half-Kelly default (conservative)
@@ -79,6 +88,11 @@ class Config:
         print(f"  Max Category Exposure: {cls.MAX_CATEGORY_EXPOSURE_PCT}%")
         # Do not print private key contents
         print(f"  Private Key Path: {cls.KALSHI_PRIVATE_KEY_PATH or 'not set'}")
+        print(f"  Polymarket Enabled: {cls.POLYMARKET_ENABLED}")
+        poly_auth = 'API key set' if cls.POLYMARKET_API_KEY else 'read-only (no key)'
+        print(f"  Polymarket Auth: {poly_auth}")
+        print(f"  Cross-platform Min Profit: {cls.CROSS_PLATFORM_MIN_PROFIT_PERCENT}%")
+        print(f"  Match Similarity Threshold: {cls.MATCH_SIMILARITY_THRESHOLD}")
 
     @classmethod
     def load_private_key(cls) -> Optional[str]:
