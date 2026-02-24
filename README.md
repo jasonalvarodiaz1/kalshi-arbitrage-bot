@@ -92,6 +92,8 @@ python kalshi_bot.py
 10. Auto-trade crypto probability strategy  — Continuous probability-based trading loop
 11. Scan for cross-platform arbitrage 🌐    — One-shot Kalshi ↔ Polymarket scan
 12. Continuous cross-platform scanner 🌐    — Continuous Kalshi ↔ Polymarket loop
+13. Scan Polymarket sports for same-event arb ⚽ — One-shot same-event binary sports arb
+14. Continuous Polymarket sports scanner ⚽  — Continuous same-event sports arb loop
 ```
 
 ## Architecture
@@ -113,6 +115,7 @@ After refactoring, the codebase is split into focused modules:
 | `notifications.py` | `NotificationManager` — email/webhook alerts |
 | `polymarket_api.py` | `PolymarketAPI` — Polymarket CLOB API client (read-only) |
 | `cross_platform_arb.py` | `CrossPlatformArbitrage` — Kalshi ↔ Polymarket arbitrage scanner |
+| `polymarket_sports_arb.py` | `PolymarketSportsArbitrage` — same-event multi-outcome arb within Polymarket |
 
 ## Cross-platform Arbitrage (Kalshi ↔ Polymarket)
 
@@ -150,6 +153,35 @@ POLYMARKET_CATEGORIES=sports,politics
 
 > **Note:** Trading on Polymarket is not yet implemented.  Options 11/12 are
 > read-only scanners that detect and log opportunities.
+
+## Polymarket Sports Arbitrage (Same-Event Multi-Outcome)
+
+Inspired by a Polymarket sports bot that earned $619K/year, this strategy runs
+same-event multi-outcome arbitrage on binary sports markets within Polymarket
+itself.
+
+### Strategy
+
+For each binary sports market (exactly 2 outcome tokens — e.g. Finland vs Switzerland):
+
+- **YES arb**: If `ask(Finland) + ask(Switzerland) < 98¢`, buy YES on both.
+  Exactly one outcome pays $1; after Polymarket's 2% fee that's 98¢, guaranteed profit.
+- **NO arb**: If `no_ask(Finland) + no_ask(Switzerland) < 98¢`, buy NO on both.
+  `no_ask(token) = 1 − best_bid(token)` — the cost of a synthetic NO position.
+
+The 98¢ threshold (not 100¢) accounts for the 2% fee Polymarket charges on
+winning payouts.
+
+### Configuration
+
+```env
+POLYMARKET_FEE_PERCENT=2.0              # Polymarket charges 2% on winning payouts
+POLYMARKET_SPORTS_MIN_PROFIT_PERCENT=0.5 # Min profit after fees (low margin, high volume)
+POLYMARKET_SPORTS_SCAN_INTERVAL=45       # Seconds between scans (30-60s recommended)
+POLYMARKET_SPORTS_MAX_POSITION_USD=5000  # Max USD per side ($3K-$9K is what the $619K bot used)
+```
+
+Use menu option **13** for a one-shot scan or option **14** for a continuous loop.
 
 ## Scripts
 

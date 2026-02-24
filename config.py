@@ -59,6 +59,12 @@ class Config:
     # Cross-platform category filter (US users: sports,politics only)
     POLYMARKET_CATEGORIES = os.getenv('POLYMARKET_CATEGORIES', 'sports,politics')  # Comma-separated categories
 
+    # Polymarket Sports Arb
+    POLYMARKET_FEE_PERCENT = float(os.getenv('POLYMARKET_FEE_PERCENT', 2.0))  # Polymarket winner fee (2%)
+    POLYMARKET_SPORTS_MIN_PROFIT_PERCENT = float(os.getenv('POLYMARKET_SPORTS_MIN_PROFIT_PERCENT', 0.5))  # Lower threshold - high-volume, low-margin
+    POLYMARKET_SPORTS_SCAN_INTERVAL = int(os.getenv('POLYMARKET_SPORTS_SCAN_INTERVAL', 45))  # Seconds between scans (30-60 recommended)
+    POLYMARKET_SPORTS_MAX_POSITION_USD = float(os.getenv('POLYMARKET_SPORTS_MAX_POSITION_USD', 5000.0))  # Max per side (the $619K bot uses $3K-$9K)
+
     # Probability Trading
     MIN_EDGE_PERCENT = float(os.getenv('MIN_EDGE_PERCENT', 3.0))  # Minimum edge to trade
     KELLY_MULTIPLIER = float(os.getenv('KELLY_MULTIPLIER', 0.5))  # Half-Kelly default (conservative)
@@ -96,6 +102,10 @@ class Config:
         print(f"  Cross-platform Min Profit: {cls.CROSS_PLATFORM_MIN_PROFIT_PERCENT}%")
         print(f"  Match Similarity Threshold: {cls.MATCH_SIMILARITY_THRESHOLD}")
         print(f"  Polymarket Categories: {cls.POLYMARKET_CATEGORIES}")
+        print(f"  Polymarket Fee: {cls.POLYMARKET_FEE_PERCENT}%")
+        print(f"  Sports Arb Min Profit: {cls.POLYMARKET_SPORTS_MIN_PROFIT_PERCENT}%")
+        print(f"  Sports Arb Scan Interval: {cls.POLYMARKET_SPORTS_SCAN_INTERVAL}s")
+        print(f"  Sports Arb Max Position: ${cls.POLYMARKET_SPORTS_MAX_POSITION_USD:.2f}")
 
     @classmethod
     def load_private_key(cls) -> Optional[str]:

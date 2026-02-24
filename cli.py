@@ -50,8 +50,10 @@ def main():
     print("10. Auto-trade crypto probability strategy (continuous loop)")
     print("11. Scan for cross-platform arbitrage (Kalshi ↔ Polymarket)")
     print("12. Continuous cross-platform arbitrage scanner")
+    print("13. Scan Polymarket sports for same-event arbitrage ⚽")
+    print("14. Continuous Polymarket sports arbitrage scanner ⚽")
     
-    choice = input("\nEnter choice (1-12): ").strip()
+    choice = input("\nEnter choice (1-14): ").strip()
     
     if choice == "1":
         opportunities = bot.scan_all_markets_concurrent()
@@ -470,6 +472,54 @@ def main():
 
         scanner = CrossPlatformArbitrage(api, storage=storage)
         scanner.scan_continuous(interval=Config.SCAN_INTERVAL_SECONDS)
+
+    elif choice == "13":
+        # One-shot Polymarket sports same-event arbitrage scan
+        from polymarket_sports_arb import PolymarketSportsArbitrage
+        from polymarket_api import PolymarketAPI
+
+        print("\n" + "="*60)
+        print("⚽ POLYMARKET SPORTS SAME-EVENT ARBITRAGE SCANNER")
+        print("="*60)
+        print(f"Fee: {Config.POLYMARKET_FEE_PERCENT}% (effective payout 98¢ per $1)")
+        print(f"Min profit: {Config.POLYMARKET_SPORTS_MIN_PROFIT_PERCENT}%")
+        print(f"Scan interval: {Config.POLYMARKET_SPORTS_SCAN_INTERVAL}s")
+        print(f"Max position: ${Config.POLYMARKET_SPORTS_MAX_POSITION_USD:.0f} per side")
+        print("="*60 + "\n")
+
+        poly_api = PolymarketAPI(api_key=Config.POLYMARKET_API_KEY)
+        scanner = PolymarketSportsArbitrage(poly_api=poly_api, storage=storage)
+        opportunities = scanner.scan_opportunities()
+
+        if opportunities:
+            print(f"\n✅ Found {len(opportunities)} Polymarket sports arb opportunities:\n")
+            for i, opp in enumerate(opportunities, 1):
+                print(f"{i}. [{opp['arb_side'].upper()}] {opp['market_title']}")
+                print(f"   {opp['strategy']}")
+                print(f"   Profit: {opp['profit_cents']}¢ ({opp['profit_percent']:.2f}%)")
+                print(f"   Max qty: {opp['max_executable_qty']} | Recommended: {opp['recommended_qty']}")
+                print()
+        else:
+            print("\n📊 No Polymarket sports arb opportunities found")
+
+    elif choice == "14":
+        # Continuous Polymarket sports same-event arbitrage scanner
+        from polymarket_sports_arb import PolymarketSportsArbitrage
+        from polymarket_api import PolymarketAPI
+
+        print("\n" + "="*60)
+        print("⚽ CONTINUOUS POLYMARKET SPORTS ARBITRAGE SCANNER")
+        print("="*60)
+        print(f"Fee: {Config.POLYMARKET_FEE_PERCENT}% (effective payout 98¢ per $1)")
+        print(f"Min profit: {Config.POLYMARKET_SPORTS_MIN_PROFIT_PERCENT}%")
+        print(f"Scan interval: {Config.POLYMARKET_SPORTS_SCAN_INTERVAL}s")
+        print(f"Max position: ${Config.POLYMARKET_SPORTS_MAX_POSITION_USD:.0f} per side")
+        print(f"Press Ctrl+C to stop")
+        print("="*60 + "\n")
+
+        poly_api = PolymarketAPI(api_key=Config.POLYMARKET_API_KEY)
+        scanner = PolymarketSportsArbitrage(poly_api=poly_api, storage=storage)
+        scanner.scan_continuous(interval=Config.POLYMARKET_SPORTS_SCAN_INTERVAL)
 
     else:
         print("Invalid choice")

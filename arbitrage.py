@@ -243,16 +243,23 @@ class KalshiArbitrageBot:
         """Detect multi-outcome event arbitrage.
         
         In an event with N mutually exclusive outcomes, exactly one resolves YES.
-        If the sum of best YES ask prices across all outcomes < 100¢,
-        buying YES on every outcome guarantees profit.
+        Checks both sides:
+        - YES arb: sum of best YES ask prices < 100¢ → buy YES on all outcomes
+        - NO arb: sum of best NO ask prices < 100¢ → buy NO on all outcomes
+        Returns the more profitable opportunity, or None if neither qualifies.
         """
         if len(event_markets) < 2:
             return None
 
         try:
-            legs = []
-            total_cost = 0
-            min_qty = float('inf')
+            yes_legs = []
+            no_legs = []
+            yes_total = 0
+            no_total = 0
+            yes_min_qty = float('inf')
+            no_min_qty = float('inf')
+            # Track whether NO data is complete for all legs
+            no_complete = True
 
             for market in event_markets:
                 thresholds = self._get_market_thresholds(market)
@@ -266,26 +273,47 @@ class KalshiArbitrageBot:
                 if not yes_asks:
                     return None
 
-                best_ask = min([a[0] for a in yes_asks])
+                best_yes = min([a[0] for a in yes_asks])
 
                 # Filter: ignore penny orders (adaptive threshold)
-                if best_ask < thresholds['min_price_cents']:
+                if best_yes < thresholds['min_price_cents']:
                     return None
 
-                # Volume available at best ask
-                best_ask_qty = next((a[1] for a in yes_asks if a[0] == best_ask), 1)
-                if best_ask_qty < thresholds['min_qty_at_best']:
+                # Volume available at best YES ask
+                best_yes_qty = next((a[1] for a in yes_asks if a[0] == best_yes), 1)
+                if best_yes_qty < thresholds['min_qty_at_best']:
                     return None
 
-                min_qty = min(min_qty, best_ask_qty)
-
-                total_cost += best_ask
-                legs.append({
+                yes_min_qty = min(yes_min_qty, best_yes_qty)
+                yes_total += best_yes
+                yes_legs.append({
                     'ticker': ticker,
                     'title': market.get('title', ''),
-                    'yes_price': best_ask,
-                    'available_qty': best_ask_qty
+                    'yes_price': best_yes,
+                    'available_qty': best_yes_qty
                 })
+
+                # NO side — collect if available
+                no_asks = orderbook.get('no_asks', [])
+                if no_asks:
+                    best_no = min([a[0] for a in no_asks])
+                    if best_no >= thresholds['min_price_cents']:
+                        best_no_qty = next((a[1] for a in no_asks if a[0] == best_no), 1)
+                        if best_no_qty >= thresholds['min_qty_at_best']:
+                            no_min_qty = min(no_min_qty, best_no_qty)
+                            no_total += best_no
+                            no_legs.append({
+                                'ticker': ticker,
+                                'title': market.get('title', ''),
+                                'no_price': best_no,
+                                'available_qty': best_no_qty
+                            })
+                        else:
+                            no_complete = False
+                    else:
+                        no_complete = False
+                else:
+                    no_complete = False
 
                 if not self._check_expiry(market):
                     return None
@@ -293,31 +321,53 @@ class KalshiArbitrageBot:
                 time.sleep(Config.RATE_LIMIT_DELAY)  # Rate limit between orderbook calls
 
             guaranteed_payout = 100  # Exactly one outcome pays $1
-            profit = guaranteed_payout - total_cost
-            if total_cost <= 0:
-                return None
-            profit_percent = (profit / total_cost) * 100
 
-            # Must be profitable but realistic
-            if profit_percent <= self.min_profit_percent:
-                return None
-            if profit_percent > self.MAX_PROFIT_PERCENT:
-                return None  # Illiquid trap
+            # --- YES arb ---
+            yes_result = None
+            if yes_total > 0:
+                yes_profit = guaranteed_payout - yes_total
+                yes_profit_pct = (yes_profit / yes_total) * 100
+                if (yes_profit_pct > self.min_profit_percent
+                        and yes_profit_pct <= self.MAX_PROFIT_PERCENT):
+                    yes_result = {
+                        'type': 'multi_leg',
+                        'arb_side': 'yes',
+                        'event_ticker': event_markets[0].get('event_ticker', 'unknown'),
+                        'num_legs': len(yes_legs),
+                        'legs': yes_legs,
+                        'total_cost': yes_total,
+                        'profit_cents': yes_profit,
+                        'profit_percent': yes_profit_pct,
+                        'max_executable_qty': int(yes_min_qty),
+                        'strategy': f'Buy YES on all {len(yes_legs)} outcomes — exactly one pays $1',
+                        'timestamp': datetime.now().isoformat()
+                    }
 
-            if profit_percent > self.min_profit_percent:
-                return {
-                    'type': 'multi_leg',
-                    'event_ticker': event_markets[0].get('event_ticker', 'unknown'),
-                    'num_legs': len(legs),
-                    'legs': legs,
-                    'total_cost': total_cost,
-                    'profit_cents': profit,
-                    'profit_percent': profit_percent,
-                    'max_executable_qty': int(min_qty),
-                    'strategy': f'Buy YES on all {len(legs)} outcomes — exactly one pays $1',
-                    'timestamp': datetime.now().isoformat()
-                }
-            return None
+            # --- NO arb ---
+            no_result = None
+            if no_complete and len(no_legs) == len(event_markets) and no_total > 0:
+                no_profit = guaranteed_payout - no_total
+                no_profit_pct = (no_profit / no_total) * 100
+                if (no_profit_pct > self.min_profit_percent
+                        and no_profit_pct <= self.MAX_PROFIT_PERCENT):
+                    no_result = {
+                        'type': 'multi_leg',
+                        'arb_side': 'no',
+                        'event_ticker': event_markets[0].get('event_ticker', 'unknown'),
+                        'num_legs': len(no_legs),
+                        'legs': no_legs,
+                        'total_cost': no_total,
+                        'profit_cents': no_profit,
+                        'profit_percent': no_profit_pct,
+                        'max_executable_qty': int(no_min_qty),
+                        'strategy': f'Buy NO on all {len(no_legs)} outcomes — exactly one pays $1',
+                        'timestamp': datetime.now().isoformat()
+                    }
+
+            # Return the more profitable opportunity (YES arb takes precedence on tie)
+            if yes_result and no_result:
+                return yes_result if yes_result['profit_percent'] >= no_result['profit_percent'] else no_result
+            return yes_result or no_result
 
         except Exception as e:
             print(f"Error analyzing event arbitrage: {e}")
