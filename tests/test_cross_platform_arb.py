@@ -108,14 +108,14 @@ class TestMatchMarkets(unittest.TestCase):
     def test_match_similar_titles(self):
         scanner, kalshi_api, poly_api = self._build_scanner()
         kalshi_api.get_all_markets.return_value = [
-            _make_kalshi_market('KX-BTC', 'Will BTC exceed $100k by year end?')
+            _make_kalshi_market('KX-ELECT', 'Will the Republican win the election?')
         ]
         poly_api.get_all_markets.return_value = [
-            _make_poly_market('abc', 'BTC exceed $100k by year end?')
+            _make_poly_market('abc', 'Republican win the election?')
         ]
         pairs = scanner.match_markets()
         self.assertEqual(len(pairs), 1)
-        self.assertEqual(pairs[0][0]['ticker'], 'KX-BTC')
+        self.assertEqual(pairs[0][0]['ticker'], 'KX-ELECT')
 
     def test_no_match_dissimilar_titles(self):
         scanner, kalshi_api, poly_api = self._build_scanner()

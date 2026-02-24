@@ -43,6 +43,19 @@ class CrossPlatformArbitrage:
     0.00–1.00) are converted via :meth:`PolymarketAPI.to_cents`.
     """
 
+    # Keywords used to identify politics-related markets (case-insensitive)
+    POLITICS_KEYWORDS = [
+        'president', 'election', 'senate', 'congress', 'governor', 'vote',
+        'party', 'democrat', 'republican', 'trump', 'biden',
+    ]
+
+    # Keywords used to identify sports-related markets (case-insensitive)
+    SPORTS_KEYWORDS = [
+        'nfl', 'nba', 'mlb', 'nhl', 'soccer', 'football', 'basketball',
+        'baseball', 'hockey', 'super bowl', 'world series', 'championship',
+        'game', 'match', 'team', 'win', 'score',
+    ]
+
     def __init__(
         self,
         kalshi_api: KalshiAPI,
@@ -69,6 +82,35 @@ class CrossPlatformArbitrage:
         self._matched_pairs: Optional[List[Tuple[Dict, Dict]]] = None
 
     # ------------------------------------------------------------------
+    # Category filtering
+    # ------------------------------------------------------------------
+
+    def _is_eligible_category(self, market: Dict) -> bool:
+        """Return True if *market* belongs to an allowed Polymarket category.
+
+        When ``Config.POLYMARKET_CATEGORIES`` is ``'all'`` every market passes.
+        Otherwise the market title is checked case-insensitively against the
+        keyword lists for each configured category.
+        """
+        categories_cfg = Config.POLYMARKET_CATEGORIES.strip().lower()
+        if categories_cfg == 'all':
+            return True
+
+        allowed = [c.strip() for c in categories_cfg.split(',') if c.strip()]
+        title = (market.get('title', '') or '').lower()
+        series_ticker = (market.get('series_ticker', '') or '').lower()
+
+        if 'politics' in allowed:
+            if any(kw in title for kw in self.POLITICS_KEYWORDS) or \
+               any(kw in series_ticker for kw in self.POLITICS_KEYWORDS):
+                return True
+        if 'sports' in allowed:
+            if any(kw in title for kw in self.SPORTS_KEYWORDS) or \
+               any(kw in series_ticker for kw in self.SPORTS_KEYWORDS):
+                return True
+        return False
+
+    # ------------------------------------------------------------------
     # Market matching
     # ------------------------------------------------------------------
 
@@ -87,9 +129,25 @@ class CrossPlatformArbitrage:
         logger.info("Fetching Polymarket markets for cross-platform matching...")
         poly_markets = self.poly_api.get_all_markets()
 
+        # Category pre-filter
+        categories_cfg = Config.POLYMARKET_CATEGORIES.strip().lower()
+        if categories_cfg == 'all':
+            eligible = kalshi_markets
+        else:
+            eligible = [m for m in kalshi_markets if self._is_eligible_category(m)]
+        filtered_out = len(kalshi_markets) - len(eligible)
+        logger.info(
+            "Category filter (%s): %d Kalshi markets eligible, %d filtered out",
+            Config.POLYMARKET_CATEGORIES, len(eligible), filtered_out,
+        )
+        print(
+            f"🔍 Category filter active ({Config.POLYMARKET_CATEGORIES}): "
+            f"{len(eligible)} markets eligible, {filtered_out} filtered out"
+        )
+
         logger.info(
             "Matching %d Kalshi vs %d Polymarket markets (threshold=%.2f)...",
-            len(kalshi_markets), len(poly_markets), self.similarity_threshold,
+            len(eligible), len(poly_markets), self.similarity_threshold,
         )
 
         # Pre-compute normalized Polymarket titles
@@ -99,7 +157,7 @@ class CrossPlatformArbitrage:
         ]
 
         pairs: List[Tuple[Dict, Dict]] = []
-        for km in kalshi_markets:
+        for km in eligible:
             k_title = _normalize_title(km.get('title', ''))
             if not k_title:
                 continue

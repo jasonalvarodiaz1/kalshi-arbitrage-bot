@@ -138,7 +138,15 @@ CROSS_PLATFORM_MIN_PROFIT_PERCENT=2.0
 
 # Title similarity threshold for market matching (0–1, default 0.85)
 MATCH_SIMILARITY_THRESHOLD=0.85
+
+# Categories to match for cross-platform arb (US users limited to sports,politics)
+# Set to 'all' to disable filtering (non-US users)
+POLYMARKET_CATEGORIES=sports,politics
 ```
+
+> **US users:** Polymarket restricts US accounts to **sports and politics** markets only.
+> The default `POLYMARKET_CATEGORIES=sports,politics` setting reflects this.
+> Non-US users can set `POLYMARKET_CATEGORIES=all` to scan all categories.
 
 > **Note:** Trading on Polymarket is not yet implemented.  Options 11/12 are
 > read-only scanners that detect and log opportunities.

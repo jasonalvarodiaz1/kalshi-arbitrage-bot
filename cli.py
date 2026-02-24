@@ -429,6 +429,10 @@ def main():
         print("="*60)
         print(f"Min profit: {Config.CROSS_PLATFORM_MIN_PROFIT_PERCENT}%")
         print(f"Similarity threshold: {Config.MATCH_SIMILARITY_THRESHOLD}")
+        _cats = Config.POLYMARKET_CATEGORIES
+        print(f"🌐 Cross-platform categories: {_cats}")
+        if _cats.strip().lower() != 'all':
+            print("   (Set POLYMARKET_CATEGORIES=all for unrestricted scanning)")
         print("="*60 + "\n")
 
         scanner = CrossPlatformArbitrage(api, storage=storage)
@@ -457,6 +461,10 @@ def main():
         print(f"Scan interval: {Config.SCAN_INTERVAL_SECONDS}s")
         print(f"Min profit: {Config.CROSS_PLATFORM_MIN_PROFIT_PERCENT}%")
         print(f"Similarity threshold: {Config.MATCH_SIMILARITY_THRESHOLD}")
+        _cats = Config.POLYMARKET_CATEGORIES
+        print(f"🌐 Cross-platform categories: {_cats}")
+        if _cats.strip().lower() != 'all':
+            print("   (Set POLYMARKET_CATEGORIES=all for unrestricted scanning)")
         print(f"Press Ctrl+C to stop")
         print("="*60 + "\n")
 
