@@ -558,6 +558,15 @@ class PolymarketSportsArbitrage:
             )
             return True
 
+        if not Config.POLYMARKET_EXECUTION_ENABLED:
+            logger.warning(
+                "SPORTS ARB: execution skipped — US accounts can only trade via the "
+                "Polymarket mobile app (API trading not available for US users). "
+                "Set POLYMARKET_EXECUTION_ENABLED=true in .env only if you have "
+                "non-US API access."
+            )
+            return False
+
         if not self.poly_api.private_key:
             logger.error("SPORTS ARB execute: POLYMARKET_PRIVATE_KEY not set; cannot sign orders")
             return False

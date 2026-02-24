@@ -407,8 +407,10 @@ class PolymarketAPI:
 
         if not self.private_key:
             logger.error(
-                "Polymarket place_order: POLYMARKET_PRIVATE_KEY not configured. "
-                "Set it in .env to enable live execution."
+                "Polymarket place_order: execution unavailable. "
+                "US accounts can only trade via the Polymarket mobile app — "
+                "API order signing is not supported for US users. "
+                "Set POLYMARKET_EXECUTION_ENABLED=false in .env (already the default)."
             )
             return None
 

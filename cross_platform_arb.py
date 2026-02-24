@@ -506,6 +506,16 @@ class CrossPlatformArbitrage:
             )
             return True
 
+        if not Config.POLYMARKET_EXECUTION_ENABLED:
+            logger.warning(
+                "XPLAT: Polymarket leg skipped — US accounts can only trade via the "
+                "Polymarket mobile app (API trading not available for US users). "
+                "Kalshi leg NOT placed to avoid a naked position. "
+                "Set POLYMARKET_EXECUTION_ENABLED=true in .env only if you have "
+                "non-US API access."
+            )
+            return False
+
         # ---- Kalshi leg ----
         try:
             kalshi_resp = self.kalshi_api.execute_trade(
@@ -589,3 +599,26 @@ class CrossPlatformArbitrage:
             print(f"Total scans: {iteration}")
             print(f"{'='*60}")
             logger.info("Cross-platform scanner stopped after %d iterations", iteration)
+
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Cross-platform Kalshi/Polymarket arbitrage scanner')
+    parser.add_argument('--once', action='store_true', help='Run a single scan and exit')
+    parser.add_argument('--interval', type=int, default=300, help='Seconds between scans (default 300)')
+    args = parser.parse_args()
+
+    Config.print_config()
+    scanner = CrossPlatformArbitrageScanner()
+
+    if args.once:
+        opps = scanner.scan_opportunities(force_refresh=True)
+        if not opps:
+            print('\nNo cross-platform arbitrage opportunities found.')
+        else:
+            print(f'\nFound {len(opps)} opportunit{"y" if len(opps)==1 else "ies"}:')
+            for o in opps:
+                print(f"  {o['kalshi_ticker']} | {o['strategy']} | profit={o['profit_cents']}c ({o['profit_percent']:.2f}%)")
+    else:
+        scanner.scan_continuous(interval=args.interval)

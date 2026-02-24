@@ -52,6 +52,10 @@ class Config:
     POLYMARKET_API_KEY = os.getenv('POLYMARKET_API_KEY')
     POLYMARKET_PRIVATE_KEY = os.getenv('POLYMARKET_PRIVATE_KEY')
     POLYMARKET_ENABLED = os.getenv('POLYMARKET_ENABLED', 'true').lower() == 'true'
+    # US users can only trade Polymarket via the mobile app — API order signing
+    # via private key is not supported for US-based accounts.  Scanners still run
+    # in read-only mode (opportunity detection only) when this is False.
+    POLYMARKET_EXECUTION_ENABLED = os.getenv('POLYMARKET_EXECUTION_ENABLED', 'false').lower() == 'true'
 
     # Cross-platform arbitrage
     CROSS_PLATFORM_MIN_PROFIT_PERCENT = float(os.getenv('CROSS_PLATFORM_MIN_PROFIT_PERCENT', 5.0))  # 5% min — covers fees+slippage on both legs
@@ -101,6 +105,11 @@ class Config:
         print(f"  Polymarket Enabled: {cls.POLYMARKET_ENABLED}")
         poly_auth = 'API key set' if cls.POLYMARKET_API_KEY else 'read-only (no key)'
         print(f"  Polymarket Auth: {poly_auth}")
+        if not cls.POLYMARKET_EXECUTION_ENABLED:
+            print(f"  Polymarket Execution: DISABLED (US accounts: app-only, no API trading)")
+        else:
+            pk_set = 'set' if cls.POLYMARKET_PRIVATE_KEY else 'NOT SET'
+            print(f"  Polymarket Execution: ENABLED (private key: {pk_set})")
         print(f"  Cross-platform Min Profit: {cls.CROSS_PLATFORM_MIN_PROFIT_PERCENT}%")
         print(f"  Match Similarity Threshold: {cls.MATCH_SIMILARITY_THRESHOLD}")
         print(f"  Polymarket Categories: {cls.POLYMARKET_CATEGORIES}")
