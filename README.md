@@ -90,6 +90,8 @@ python kalshi_bot.py
 8. Continuous auto-trading scanner 🤖       — Scans and executes arbitrage automatically
 9. Scan crypto markets for probability edge — BTC/ETH interval market analysis
 10. Auto-trade crypto probability strategy  — Continuous probability-based trading loop
+11. Scan for cross-platform arbitrage 🌐    — One-shot Kalshi ↔ Polymarket scan
+12. Continuous cross-platform scanner 🌐    — Continuous Kalshi ↔ Polymarket loop
 ```
 
 ## Architecture
@@ -109,6 +111,37 @@ After refactoring, the codebase is split into focused modules:
 | `storage.py` | `Storage` — SQLite persistence |
 | `ws_trader.py` | `WSTrader` — WebSocket real-time trading |
 | `notifications.py` | `NotificationManager` — email/webhook alerts |
+| `polymarket_api.py` | `PolymarketAPI` — Polymarket CLOB API client (read-only) |
+| `cross_platform_arb.py` | `CrossPlatformArbitrage` — Kalshi ↔ Polymarket arbitrage scanner |
+
+## Cross-platform Arbitrage (Kalshi ↔ Polymarket)
+
+Price divergences of 2–7¢ are common on overlapping events between Kalshi
+and Polymarket.  The scanner detects two strategies:
+
+- **Buy YES on Kalshi + NO on Polymarket** when `kalshi_yes_ask + poly_no_ask < 100¢`
+- **Buy YES on Polymarket + NO on Kalshi** when `poly_yes_ask + kalshi_no_ask < 100¢`
+
+### Configuration
+
+Add these to your `.env`:
+
+```env
+# Optional API key for Polymarket CLOB (read-only works without it)
+POLYMARKET_API_KEY=
+
+# Disable Polymarket scanning entirely
+POLYMARKET_ENABLED=true
+
+# Minimum profit % to report a cross-platform opportunity (default 2.0)
+CROSS_PLATFORM_MIN_PROFIT_PERCENT=2.0
+
+# Title similarity threshold for market matching (0–1, default 0.85)
+MATCH_SIMILARITY_THRESHOLD=0.85
+```
+
+> **Note:** Trading on Polymarket is not yet implemented.  Options 11/12 are
+> read-only scanners that detect and log opportunities.
 
 ## Scripts
 

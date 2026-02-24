@@ -4,3 +4,4 @@ PyJWT>=2.8.0
 cryptography>=40.0.0
 scipy>=1.10.0
 websocket-client>=1.6.0
+py-clob-client>=0.17.0  # optional: official Polymarket CLOB client
