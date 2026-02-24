@@ -37,7 +37,10 @@ class PolymarketSportsArbitrage:
     """
 
     def __init__(self, poly_api=None, min_profit_percent=None, storage=None):
-        self.poly_api = poly_api or PolymarketAPI(api_key=Config.POLYMARKET_API_KEY)
+        self.poly_api = poly_api or PolymarketAPI(
+            api_key=Config.POLYMARKET_API_KEY,
+            private_key=Config.POLYMARKET_PRIVATE_KEY,
+        )
         self.min_profit_percent = (
             min_profit_percent
             if min_profit_percent is not None
@@ -462,6 +465,7 @@ class PolymarketSportsArbitrage:
                             self.storage.save_opportunity(yes_opp)
                         except Exception as exc:
                             logger.warning("Failed to save opportunity: %s", exc)
+                    self.execute_opportunity(yes_opp)
 
                 # NO arb check
                 no_opp = self._check_no_arb(market, ob_a, ob_b)
@@ -477,6 +481,7 @@ class PolymarketSportsArbitrage:
                             self.storage.save_opportunity(no_opp)
                         except Exception as exc:
                             logger.warning("Failed to save opportunity: %s", exc)
+                    self.execute_opportunity(no_opp)
 
             except Exception as exc:
                 logger.error("Error scanning market %s: %s", market_title, exc)
@@ -489,6 +494,84 @@ class PolymarketSportsArbitrage:
             len(opportunities), len(sports_markets),
         )
         return opportunities
+
+    def execute_opportunity(self, opp: Dict) -> bool:
+        """Execute both legs of a Polymarket sports arb opportunity.
+
+        Both legs are placed as FOK (Fill-or-Kill) orders.  If Leg A (token A)
+        fails to fill, Leg B is NOT sent — avoiding a naked position.  If Leg A
+        fills but Leg B fails, a WARNING is logged because the position is now
+        unhedged.
+
+        When ``PAPER_TRADING=true`` both legs are simulated and logged only.
+        Uses 1 share per execution cycle.
+
+        Returns True if both legs were successfully attempted.
+        """
+        arb_type = opp.get('type', 'sports_arb')
+        token_a = opp.get('token_a_id') or opp.get('yes_token_id')
+        token_b = opp.get('token_b_id') or opp.get('no_token_id')
+        price_a = opp.get('ask_a', 0) / 100.0   # opp stores cents
+        price_b = opp.get('ask_b', 0) / 100.0
+        qty = float(opp.get('recommended_qty', 1) or 1)
+        # Cap size in case the recommended_qty field was not set
+        qty = min(qty, Config.POLYMARKET_SPORTS_MAX_POSITION_USD / 100.0)
+
+        if Config.PAPER_TRADING:
+            logger.info(
+                "PAPER SPORTS ARB [%s]: token_a=%s @ %.4f + token_b=%s @ %.4f | qty=%.1f profit=%d¢ (%.2f%%)",
+                arb_type,
+                (token_a or '')[:16], price_a,
+                (token_b or '')[:16], price_b,
+                qty, opp.get('profit_cents', 0), opp.get('profit_percent', 0),
+            )
+            return True
+
+        if not self.poly_api.private_key:
+            logger.error("SPORTS ARB execute: POLYMARKET_PRIVATE_KEY not set; cannot sign orders")
+            return False
+
+        # ---- Leg A ----
+        try:
+            resp_a = self.poly_api.place_order(
+                token_id=token_a,
+                side='BUY',
+                price=price_a,
+                size=qty,
+                order_type='FOK',
+            )
+            if not resp_a:
+                logger.error("SPORTS ARB: Leg A failed for token %s", (token_a or '')[:16])
+                return False
+            logger.info("SPORTS ARB: Leg A placed — %s @ %.4f x %.1f", (token_a or '')[:16], price_a, qty)
+        except Exception as exc:
+            logger.error("SPORTS ARB: Leg A error for token %s: %s", (token_a or '')[:16], exc)
+            return False
+
+        # ---- Leg B ----
+        try:
+            resp_b = self.poly_api.place_order(
+                token_id=token_b,
+                side='BUY',
+                price=price_b,
+                size=qty,
+                order_type='FOK',
+            )
+            if not resp_b:
+                logger.warning(
+                    "SPORTS ARB: Leg B FAILED for token %s — unhedged position on %s!",
+                    (token_b or '')[:16], (token_a or '')[:16],
+                )
+                return False
+            logger.info("SPORTS ARB: Leg B placed — %s @ %.4f x %.1f", (token_b or '')[:16], price_b, qty)
+        except Exception as exc:
+            logger.error(
+                "SPORTS ARB: Leg B error for token %s: %s — unhedged position on %s!",
+                (token_b or '')[:16], exc, (token_a or '')[:16],
+            )
+            return False
+
+        return True
 
     def scan_continuous(self, interval: int = 60) -> None:
         """Continuously scan for Polymarket sports arb opportunities.

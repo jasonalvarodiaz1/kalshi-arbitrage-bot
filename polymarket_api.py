@@ -33,8 +33,9 @@ class PolymarketAPI:
 
     BASE_URL = BASE_URL
 
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, private_key: Optional[str] = None):
         self.api_key = api_key
+        self.private_key = private_key  # Ethereum private key for EIP-712 order signing
         self._local = threading.local()
 
     # ------------------------------------------------------------------
@@ -245,3 +246,88 @@ class PolymarketAPI:
     def to_cents(price: float) -> int:
         """Convert Polymarket USDC price (0.00–1.00) to integer cents (0–100)."""
         return round(price * 100)
+
+    # ------------------------------------------------------------------
+    # Order execution
+    # ------------------------------------------------------------------
+
+    def place_order(
+        self,
+        token_id: str,
+        side: str,        # 'BUY'
+        price: float,     # limit price in USDC (0.0–1.0)
+        size: float,      # number of contracts
+        order_type: str = 'GTC',
+    ) -> Optional[Dict]:
+        """Place a Polymarket order via the CLOB API (EIP-712 signed).
+
+        Requires ``POLYMARKET_PRIVATE_KEY`` to be set in ``.env``.
+        When ``PAPER_TRADING=true`` the order is logged but NOT submitted.
+
+        Args:
+            token_id:   Polymarket outcome token ID.
+            side:       'BUY' (only buy-side is currently supported).
+            price:      Limit price in USDC (0.0–1.0).
+            size:       Number of contracts.
+            order_type: 'GTC' (Good-Till-Cancelled) or 'FOK' (Fill-Or-Kill).
+
+        Returns:
+            Response dict from the CLOB API, or ``None`` on failure.
+            In paper mode returns a simulated response dict.
+        """
+        from config import Config  # local import to avoid circular dependency
+
+        if Config.PAPER_TRADING:
+            logger.info(
+                "PAPER Polymarket order: %s %s @ %.4f x %.1f [%s]",
+                side, token_id[:16], price, size, order_type,
+            )
+            return {
+                'status': 'paper',
+                'token_id': token_id,
+                'side': side,
+                'price': price,
+                'size': size,
+                'order_type': order_type,
+            }
+
+        if not self.private_key:
+            logger.error(
+                "Polymarket place_order: POLYMARKET_PRIVATE_KEY not configured. "
+                "Set it in .env to enable live execution."
+            )
+            return None
+
+        try:
+            from py_clob_client.client import ClobClient
+            from py_clob_client.clob_types import OrderArgs, OrderType
+
+            client = ClobClient(
+                host=self.BASE_URL,
+                chain_id=137,      # Polygon mainnet
+                key=self.private_key,
+            )
+
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=price,
+                size=size,
+                side=side,
+            )
+
+            signed_order = client.create_order(order_args)
+            ot = OrderType.FOK if order_type == 'FOK' else OrderType.GTC
+            resp = client.post_order(signed_order, ot)
+
+            logger.info(
+                "Polymarket order placed: %s %s @ %.4f x %.1f — resp: %s",
+                side, token_id[:16], price, size, resp,
+            )
+            return resp
+
+        except ImportError:
+            logger.error("py-clob-client not installed. Run: pip install py-clob-client")
+            return None
+        except Exception as exc:
+            logger.error("Polymarket order error for %s: %s", token_id[:16], exc)
+            return None

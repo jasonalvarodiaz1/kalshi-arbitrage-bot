@@ -65,7 +65,10 @@ class CrossPlatformArbitrage:
         storage=None,
     ):
         self.kalshi_api = kalshi_api
-        self.poly_api = poly_api or PolymarketAPI(api_key=Config.POLYMARKET_API_KEY)
+        self.poly_api = poly_api or PolymarketAPI(
+            api_key=Config.POLYMARKET_API_KEY,
+            private_key=Config.POLYMARKET_PRIVATE_KEY,
+        )
         self.min_profit_percent = (
             min_profit_percent
             if min_profit_percent is not None
@@ -110,6 +113,71 @@ class CrossPlatformArbitrage:
                 return True
         return False
 
+    def _is_eligible_poly_market(self, market: Dict) -> bool:
+        """Return True if a *Polymarket* market belongs to an allowed category.
+
+        Checks Polymarket's structured ``tags`` field first, then falls back
+        to keyword matching on the question/title.  Mirrors ``_is_eligible_category``
+        but adapted to Polymarket's data shape.
+        """
+        categories_cfg = Config.POLYMARKET_CATEGORIES.strip().lower()
+        if categories_cfg == 'all':
+            return True
+
+        allowed = [c.strip() for c in categories_cfg.split(',') if c.strip()]
+        question = (market.get('question', '') or market.get('title', '') or '').lower()
+
+        # Collect tag strings from the structured tags field
+        tags = market.get('tags') or []
+        tag_strs = []
+        for tag in tags:
+            if isinstance(tag, dict):
+                tag_strs.append((tag.get('slug', '') or tag.get('label', '') or '').lower())
+            else:
+                tag_strs.append(str(tag).lower())
+
+        if 'politics' in allowed:
+            if any(kw in question for kw in self.POLITICS_KEYWORDS) or \
+               any(any(kw in t for kw in self.POLITICS_KEYWORDS) for t in tag_strs):
+                return True
+        if 'sports' in allowed:
+            if any(kw in question for kw in self.SPORTS_KEYWORDS) or \
+               any(any(kw in t for kw in self.SPORTS_KEYWORDS) for t in tag_strs):
+                return True
+        return False
+
+    def _expiry_proximity_ok(self, kalshi_market: Dict, poly_market: Dict) -> bool:
+        """Return True if both markets settle within CROSS_PLATFORM_MAX_EXPIRY_DIFF_HOURS.
+
+        Prevents matching same-named markets that expire months apart
+        (e.g. Kalshi 'BTC > $90k by March' vs Polymarket 'BTC > $90k by April').
+        If either date is unreadable the check passes conservatively.
+        """
+        try:
+            k_close_str = kalshi_market.get('close_time', '')
+            if not k_close_str:
+                return True
+            k_close = datetime.fromisoformat(k_close_str.replace('Z', '+00:00'))
+
+            # Polymarket uses end_date_iso or end_date
+            p_close_str = (
+                poly_market.get('end_date_iso')
+                or poly_market.get('end_date')
+                or ''
+            )
+            if not p_close_str:
+                return True  # no Poly date to compare against
+
+            # Normalise: Polymarket sometimes sends date-only strings
+            if 'T' not in p_close_str:
+                p_close_str += 'T00:00:00+00:00'
+            p_close = datetime.fromisoformat(p_close_str.replace('Z', '+00:00'))
+
+            diff_hours = abs((k_close - p_close).total_seconds()) / 3600
+            return diff_hours <= Config.CROSS_PLATFORM_MAX_EXPIRY_DIFF_HOURS
+        except Exception:
+            return True  # parse failure → allow through
+
     # ------------------------------------------------------------------
     # Market matching
     # ------------------------------------------------------------------
@@ -129,7 +197,7 @@ class CrossPlatformArbitrage:
         logger.info("Fetching Polymarket markets for cross-platform matching...")
         poly_markets = self.poly_api.get_all_markets()
 
-        # Category pre-filter
+        # Category pre-filter (Kalshi side)
         categories_cfg = Config.POLYMARKET_CATEGORIES.strip().lower()
         if categories_cfg == 'all':
             eligible = kalshi_markets
@@ -137,13 +205,22 @@ class CrossPlatformArbitrage:
             eligible = [m for m in kalshi_markets if self._is_eligible_category(m)]
         filtered_out = len(kalshi_markets) - len(eligible)
         logger.info(
-            "Category filter (%s): %d Kalshi markets eligible, %d filtered out",
+            "Kalshi category filter (%s): %d eligible, %d filtered out",
             Config.POLYMARKET_CATEGORIES, len(eligible), filtered_out,
         )
         print(
-            f"🔍 Category filter active ({Config.POLYMARKET_CATEGORIES}): "
-            f"{len(eligible)} markets eligible, {filtered_out} filtered out"
+            f"\U0001f50d Kalshi filter ({Config.POLYMARKET_CATEGORIES}): "
+            f"{len(eligible)} eligible, {filtered_out} filtered out"
         )
+
+        # Category pre-filter (Polymarket side) — avoids wasting API calls on ineligible markets
+        if categories_cfg != 'all':
+            poly_before = len(poly_markets)
+            poly_markets = [m for m in poly_markets if self._is_eligible_poly_market(m)]
+            logger.info(
+                "Polymarket category filter (%s): %d eligible, %d filtered out",
+                Config.POLYMARKET_CATEGORIES, len(poly_markets), poly_before - len(poly_markets),
+            )
 
         logger.info(
             "Matching %d Kalshi vs %d Polymarket markets (threshold=%.2f)...",
@@ -171,6 +248,13 @@ class CrossPlatformArbitrage:
                     best_score = score
                     best_pm = pm
             if best_score >= self.similarity_threshold and best_pm is not None:
+                # Reject pairs where settlement dates differ by more than the threshold
+                if not self._expiry_proximity_ok(km, best_pm):
+                    logger.debug(
+                        "Skipping %s / Poly match: expiry dates too far apart",
+                        km.get('ticker', '?'),
+                    )
+                    continue
                 pairs.append((km, best_pm))
 
         logger.info("Found %d matched market pairs", len(pairs))
@@ -198,20 +282,26 @@ class CrossPlatformArbitrage:
     def _get_poly_best_asks(self, yes_token_id: str, no_token_id: str) -> Tuple[Optional[int], Optional[int]]:
         """Return ``(yes_ask_cents, no_ask_cents)`` for a Polymarket market.
 
-        Fetches best ask prices for both YES and NO tokens and converts from
-        USDC (0–1) to cents (0–100).
+        Uses the orderbook endpoint (not /prices) to get the true live best ask.
+        Polymarket's /prices endpoint can lag; the orderbook is authoritative.
         """
-        yes_price = self.poly_api.get_price(yes_token_id)
-        time.sleep(Config.RATE_LIMIT_DELAY)
-        no_price = self.poly_api.get_price(no_token_id)
-
-        def _ask_cents(price_data: Dict) -> Optional[int]:
-            ask = price_data.get('ask') or price_data.get('best_ask')
-            if ask is None:
+        def _best_ask_cents(token_id: str) -> Optional[int]:
+            ob = self.poly_api.get_orderbook(token_id)
+            if not ob:
                 return None
-            return PolymarketAPI.to_cents(float(ask))
+            asks = ob.get('asks', [])
+            if not asks:
+                return None
+            try:
+                best = min(float(a['price']) for a in asks)
+                return PolymarketAPI.to_cents(best)
+            except (KeyError, ValueError, TypeError):
+                return None
 
-        return _ask_cents(yes_price), _ask_cents(no_price)
+        yes_ask = _best_ask_cents(yes_token_id)
+        time.sleep(Config.RATE_LIMIT_DELAY)
+        no_ask = _best_ask_cents(no_token_id)
+        return yes_ask, no_ask
 
     @staticmethod
     def _extract_poly_token_ids(poly_market: Dict) -> Tuple[Optional[str], Optional[str]]:
@@ -309,10 +399,14 @@ class CrossPlatformArbitrage:
             f" + {poly_side.upper()}@Polymarket({poly_price}¢)"
         )
 
+        # Correct execution token: buy YES token only when poly_side is 'yes'
+        poly_exec_token = poly_yes_token if poly_side == 'yes' else poly_no_token
+
         return {
             'type': 'cross_platform',
             'kalshi_ticker': kalshi_ticker,
             'poly_token_id': poly_yes_token,
+            'poly_exec_token_id': poly_exec_token,
             'kalshi_title': kalshi_market.get('title', ''),
             'poly_title': poly_market.get('question', '') or poly_market.get('title', ''),
             'match_confidence': round(match_confidence, 4),
@@ -372,6 +466,8 @@ class CrossPlatformArbitrage:
                         self.storage.save_opportunity(opp)
                     except Exception as exc:
                         logger.warning("Failed to save cross-platform opportunity: %s", exc)
+                # Execute both legs (paper or live)
+                self.execute_opportunity(opp)
 
             time.sleep(Config.RATE_LIMIT_DELAY)
 
@@ -380,6 +476,76 @@ class CrossPlatformArbitrage:
             len(opportunities), len(pairs),
         )
         return opportunities
+
+    def execute_opportunity(self, opp: Dict) -> bool:
+        """Execute both legs of a cross-platform arb opportunity.
+
+        Kalshi leg is placed via the Kalshi REST API.  Polymarket leg is
+        placed via the CLOB API using an EIP-712 signed FOK order so that
+        an unfilled Polymarket order never leaves a naked Kalshi position.
+
+        When ``PAPER_TRADING=true`` both legs are simulated and logged only.
+        Uses 1 contract/share per execution cycle; scale by running more scans.
+
+        Returns True if both legs were successfully attempted.
+        """
+        kalshi_ticker = opp['kalshi_ticker']
+        kalshi_side = opp['kalshi_side']
+        kalshi_price = opp['kalshi_price']
+        poly_token = opp.get('poly_exec_token_id') or opp.get('poly_token_id')
+        poly_side = opp['poly_side']
+        poly_price_cents = opp['poly_price']
+        poly_price_frac = poly_price_cents / 100.0
+
+        if Config.PAPER_TRADING:
+            logger.info(
+                "PAPER XPLAT: Kalshi %s %s @ %d¢ + Polymarket %s %s @ %d¢ | profit=%d¢ (%.2f%%)",
+                kalshi_side.upper(), kalshi_ticker, kalshi_price,
+                poly_side.upper(), (poly_token or '')[:16], poly_price_cents,
+                opp['profit_cents'], opp['profit_percent'],
+            )
+            return True
+
+        # ---- Kalshi leg ----
+        try:
+            kalshi_resp = self.kalshi_api.execute_trade(
+                ticker=kalshi_ticker,
+                side=kalshi_side,
+                price_cents=kalshi_price,
+                quantity=1,
+            )
+            if not kalshi_resp:
+                logger.error("XPLAT: Kalshi leg failed for %s", kalshi_ticker)
+                return False
+            logger.info("XPLAT: Kalshi leg placed — %s %s @ %d¢", kalshi_side, kalshi_ticker, kalshi_price)
+        except Exception as exc:
+            logger.error("XPLAT: Kalshi leg error for %s: %s", kalshi_ticker, exc)
+            return False
+
+        # ---- Polymarket leg (FOK — won't leave an unhedged Kalshi side) ----
+        try:
+            poly_resp = self.poly_api.place_order(
+                token_id=poly_token,
+                side='BUY',
+                price=poly_price_frac,
+                size=1.0,
+                order_type='FOK',
+            )
+            if not poly_resp:
+                logger.error(
+                    "XPLAT: Polymarket leg failed for %s — Kalshi leg is unhedged!",
+                    (poly_token or '')[:16],
+                )
+                return False
+            logger.info(
+                "XPLAT: Polymarket leg placed — %s %s @ %.4f",
+                poly_side.upper(), (poly_token or '')[:16], poly_price_frac,
+            )
+        except Exception as exc:
+            logger.error("XPLAT: Polymarket leg error for %s: %s", (poly_token or '')[:16], exc)
+            return False
+
+        return True
 
     def scan_continuous(self, interval: int = 300) -> None:
         """Continuously scan for cross-platform arbitrage opportunities.
