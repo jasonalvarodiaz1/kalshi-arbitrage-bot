@@ -56,6 +56,8 @@ class Config:
     # Cross-platform arbitrage
     CROSS_PLATFORM_MIN_PROFIT_PERCENT = float(os.getenv('CROSS_PLATFORM_MIN_PROFIT_PERCENT', 2.0))
     MATCH_SIMILARITY_THRESHOLD = float(os.getenv('MATCH_SIMILARITY_THRESHOLD', 0.85))
+    # Cross-platform category filter (US users: sports,politics only)
+    POLYMARKET_CATEGORIES = os.getenv('POLYMARKET_CATEGORIES', 'sports,politics')  # Comma-separated categories
 
     # Probability Trading
     MIN_EDGE_PERCENT = float(os.getenv('MIN_EDGE_PERCENT', 3.0))  # Minimum edge to trade
@@ -93,6 +95,7 @@ class Config:
         print(f"  Polymarket Auth: {poly_auth}")
         print(f"  Cross-platform Min Profit: {cls.CROSS_PLATFORM_MIN_PROFIT_PERCENT}%")
         print(f"  Match Similarity Threshold: {cls.MATCH_SIMILARITY_THRESHOLD}")
+        print(f"  Polymarket Categories: {cls.POLYMARKET_CATEGORIES}")
 
     @classmethod
     def load_private_key(cls) -> Optional[str]:
