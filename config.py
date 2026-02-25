@@ -64,6 +64,9 @@ class Config:
     POLYMARKET_CATEGORIES = os.getenv('POLYMARKET_CATEGORIES', 'sports,politics')  # Comma-separated categories
     # Max hours of difference in settlement dates between matched Kalshi/Poly markets
     CROSS_PLATFORM_MAX_EXPIRY_DIFF_HOURS = int(os.getenv('CROSS_PLATFORM_MAX_EXPIRY_DIFF_HOURS', 48))
+    # Kalshi market page cap for cross-platform matching (200 markets/page).
+    # Execution is blocked for US users anyway; this is purely a monitoring scan.
+    CROSS_PLATFORM_KALSHI_MAX_PAGES = int(os.getenv('CROSS_PLATFORM_KALSHI_MAX_PAGES', 10))
 
     # Polymarket Sports Arb
     POLYMARKET_FEE_PERCENT = float(os.getenv('POLYMARKET_FEE_PERCENT', 2.0))  # Polymarket winner fee (2%)

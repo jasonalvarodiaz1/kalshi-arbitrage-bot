@@ -193,12 +193,33 @@ class CrossPlatformArbitrage:
             return self._matched_pairs
 
         logger.info("Fetching Kalshi markets for cross-platform matching...")
-        kalshi_markets = self.kalshi_api.get_all_markets(status="open")
+        # Cap pages to avoid fetching all 87k+ markets. Cross-platform execution is
+        # blocked for US users (Polymarket app-only), so this scanner is monitoring only.
+        # Increase CROSS_PLATFORM_KALSHI_MAX_PAGES in .env to scan more Kalshi markets.
+        kalshi_max_pages = int(getattr(Config, 'CROSS_PLATFORM_KALSHI_MAX_PAGES', 10))
+        kalshi_markets = self.kalshi_api.get_all_markets(status="open", max_pages=kalshi_max_pages)
+        logger.info("Kalshi: %d markets fetched (%d pages cap)", len(kalshi_markets), kalshi_max_pages)
+
         logger.info("Fetching Polymarket markets for cross-platform matching...")
-        poly_markets = self.poly_api.get_all_markets()
+        # Use tag-filtered Gamma API fetch instead of fetching all markets
+        categories_cfg = Config.POLYMARKET_CATEGORIES.strip().lower()
+        poly_tags = [t.strip() for t in categories_cfg.split(',') if t.strip()] if categories_cfg != 'all' else ['sports', 'politics']
+        poly_markets: List[Dict] = []
+        for tag in poly_tags:
+            tag_markets = self.poly_api.get_markets_for_tag(tag, min_liquidity=25.0)
+            poly_markets.extend(tag_markets)
+        # De-duplicate by conditionId / id in case tags overlap
+        seen_ids: set = set()
+        poly_deduped: List[Dict] = []
+        for m in poly_markets:
+            mid = m.get('conditionId') or m.get('id') or id(m)
+            if mid not in seen_ids:
+                seen_ids.add(mid)
+                poly_deduped.append(m)
+        poly_markets = poly_deduped
+        logger.info("Polymarket: %d unique binary markets (tags: %s)", len(poly_markets), poly_tags)
 
         # Category pre-filter (Kalshi side)
-        categories_cfg = Config.POLYMARKET_CATEGORIES.strip().lower()
         if categories_cfg == 'all':
             eligible = kalshi_markets
         else:
@@ -213,14 +234,7 @@ class CrossPlatformArbitrage:
             f"{len(eligible)} eligible, {filtered_out} filtered out"
         )
 
-        # Category pre-filter (Polymarket side) — avoids wasting API calls on ineligible markets
-        if categories_cfg != 'all':
-            poly_before = len(poly_markets)
-            poly_markets = [m for m in poly_markets if self._is_eligible_poly_market(m)]
-            logger.info(
-                "Polymarket category filter (%s): %d eligible, %d filtered out",
-                Config.POLYMARKET_CATEGORIES, len(poly_markets), poly_before - len(poly_markets),
-            )
+        # Polymarket is already tag-filtered above — no further post-filter needed
 
         logger.info(
             "Matching %d Kalshi vs %d Polymarket markets (threshold=%.2f)...",
@@ -610,7 +624,9 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     Config.print_config()
-    scanner = CrossPlatformArbitrageScanner()
+    from kalshi_bot import KalshiAPI
+    kalshi = KalshiAPI(api_key=Config.KALSHI_API_KEY)
+    scanner = CrossPlatformArbitrage(kalshi_api=kalshi)
 
     if args.once:
         opps = scanner.scan_opportunities(force_refresh=True)

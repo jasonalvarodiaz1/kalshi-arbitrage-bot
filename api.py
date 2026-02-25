@@ -308,13 +308,21 @@ class KalshiAPI:
             print(f"Error: {e}")
             return [], None
 
-    def get_all_markets(self, status: str = "open", series_ticker: str = None) -> List[Dict]:
-        """Fetch ALL markets using pagination."""
+    def get_all_markets(self, status: str = "open", series_ticker: str = None, max_pages: int = 0) -> List[Dict]:
+        """Fetch markets using pagination.
+
+        Args:
+            status: Market status filter (default 'open').
+            series_ticker: Optional series ticker filter.
+            max_pages: Maximum pages to fetch (0 = no limit, fetches all pages).
+        """
         all_markets = []
         cursor = None
         page = 0
         while True:
             page += 1
+            if max_pages > 0 and page > max_pages:
+                break
             markets, cursor = self.get_markets(status=status, limit=200, cursor=cursor, series_ticker=series_ticker)
             all_markets.extend(markets)
             if not cursor or not markets:
