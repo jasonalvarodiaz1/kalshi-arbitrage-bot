@@ -264,7 +264,7 @@ class ManifoldArbitrage:
             if best_score >= self.similarity_threshold and best_mm is not None:
                 pairs.append((km, best_mm, best_score))
 
-        logger.info("Found %d matched Kalshi ↔ Manifold market pairs", len(pairs))
+        logger.info("Found %d matched Kalshi<->Manifold market pairs", len(pairs))
         self._matched_pairs = pairs
         return pairs
 
@@ -342,7 +342,7 @@ class ManifoldArbitrage:
         min_kalshi_price = 3
         if kalshi_yes_ask < min_kalshi_price and kalshi_no_ask < min_kalshi_price:
             logger.debug(
-                "Skipping %s: Kalshi prices too low (yes=%s no=%s) — likely illiquid",
+                "Skipping %s: Kalshi prices too low (yes=%s no=%s) - likely illiquid",
                 kalshi_ticker, kalshi_yes_ask, kalshi_no_ask,
             )
             return None
@@ -382,8 +382,8 @@ class ManifoldArbitrage:
             return None
 
         strategy = (
-            f"Buy {kalshi_side.upper()}@Kalshi({kalshi_price}¢)"
-            f" + {manifold_side.upper()}@Manifold({manifold_price}¢)"
+            f"Buy {kalshi_side.upper()}@Kalshi({kalshi_price}c)"
+            f" + {manifold_side.upper()}@Manifold({manifold_price}c)"
         )
 
         return {
@@ -412,17 +412,17 @@ class ManifoldArbitrage:
     # ------------------------------------------------------------------
 
     def scan_opportunities(self, force_refresh: bool = False) -> List[Dict]:
-        """Scan all matched pairs and return Kalshi ↔ Manifold arb opportunities."""
+        """Scan all matched pairs and return Kalshi<->Manifold arb opportunities."""
         if not Config.MANIFOLD_ENABLED:
             logger.info("Manifold scanning disabled (MANIFOLD_ENABLED=false)")
             return []
 
         pairs = self.match_markets(force_refresh=force_refresh)
         if not pairs:
-            logger.info("No matched Kalshi ↔ Manifold market pairs found")
+            logger.info("No matched Kalshi<->Manifold market pairs found")
             return []
 
-        logger.info("Scanning %d matched pairs for Kalshi ↔ Manifold arbitrage...", len(pairs))
+        logger.info("Scanning %d matched pairs for Kalshi<->Manifold arbitrage...", len(pairs))
         opportunities: List[Dict] = []
 
         for km, mm, confidence in pairs:
@@ -438,7 +438,7 @@ class ManifoldArbitrage:
             if opp:
                 opportunities.append(opp)
                 logger.info(
-                    "✅ MANIFOLD ARB: %s ↔ Manifold(%s) — %s¢ (%.2f%%)",
+                    "[OK] MANIFOLD ARB: %s <-> Manifold(%s) -- %sc (%.2f%%)",
                     opp['kalshi_ticker'], opp['manifold_id'],
                     opp['profit_cents'], opp['profit_percent'],
                 )
