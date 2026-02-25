@@ -94,6 +94,8 @@ python kalshi_bot.py
 12. Continuous cross-platform scanner 🌐    — Continuous Kalshi ↔ Polymarket loop
 13. Scan Polymarket sports for same-event arb ⚽ — One-shot same-event binary sports arb
 14. Continuous Polymarket sports scanner ⚽  — Continuous same-event sports arb loop
+15. Scan Kalshi ↔ Manifold cross-platform arb 🎯 — One-shot Kalshi ↔ Manifold scan
+16. Continuous Kalshi ↔ Manifold scanner 🎯  — Continuous Kalshi ↔ Manifold loop
 ```
 
 ## Architecture
@@ -116,6 +118,8 @@ After refactoring, the codebase is split into focused modules:
 | `polymarket_api.py` | `PolymarketAPI` — Polymarket CLOB API client (read-only) |
 | `cross_platform_arb.py` | `CrossPlatformArbitrage` — Kalshi ↔ Polymarket arbitrage scanner |
 | `polymarket_sports_arb.py` | `PolymarketSportsArbitrage` — same-event multi-outcome arb within Polymarket |
+| `manifold_api.py` | `ManifoldAPI` — Manifold Markets API client (reads + order placement) |
+| `manifold_arb.py` | `ManifoldArbitrage` — Kalshi ↔ Manifold cross-platform arbitrage scanner |
 
 ## Cross-platform Arbitrage (Kalshi ↔ Polymarket)
 
@@ -182,6 +186,51 @@ POLYMARKET_SPORTS_MAX_POSITION_USD=5000  # Max USD per side ($3K-$9K is what the
 ```
 
 Use menu option **13** for a one-shot scan or option **14** for a continuous loop.
+
+## Manifold Markets Arbitrage (Kalshi ↔ Manifold)
+
+[Manifold Markets](https://manifold.markets) is a prediction market platform that is **fully
+accessible for US users** with no trading restrictions.  Unlike Polymarket (iOS-only for US),
+Manifold's API supports both reading market data and placing bets with just an API key.
+
+### Why Manifold?
+
+- **No US restrictions** — full API access for US accounts, including order placement
+- **0% trading fees** — no fee drag on arbitrage profits
+- **Sweepstakes markets** — real-money markets using Sweepcash (redeemable for USD)
+- **AMM pricing** — prices lag Kalshi by 5–15¢ on the same events due to different
+  user bases and AMM-based pricing, creating cross-platform opportunities
+
+### Currencies
+
+- **Mana (M$)** — play money used in most Manifold markets
+- **Sweepcash (S$)** — real money (Sweepstakes markets), redeemable for USD
+
+The scanner focuses on **Sweepstakes markets** (`MANIFOLD_SWEEPSTAKES_ONLY=true`) for
+real-money arbitrage.
+
+### Strategy
+
+- **Buy YES on Kalshi + NO on Manifold** when `kalshi_yes_ask + manifold_no_price < 100¢`
+- **Buy YES on Manifold + NO on Kalshi** when `manifold_yes_price + kalshi_no_ask < 100¢`
+
+Since Manifold uses an AMM, the YES price is simply the market's `probability` field and
+the NO price is `1 − probability`.  Both are compared to Kalshi prices in cents.
+
+### Configuration
+
+```env
+# Get your API key: https://manifold.markets/profile (API tab)
+MANIFOLD_API_KEY=
+MANIFOLD_ENABLED=true
+MANIFOLD_SWEEPSTAKES_ONLY=true       # Only scan Sweepcash markets (real money)
+MANIFOLD_MIN_PROFIT_PERCENT=3.0      # Min cross-platform edge (no fees, but AMM slippage)
+MANIFOLD_SCAN_INTERVAL=90            # Seconds between scans (AMM prices move slowly)
+MANIFOLD_MAX_BET_USD=50              # Max per bet (liquidity is thin — start small)
+MANIFOLD_CATEGORIES=all              # 'all', 'politics', 'sports', 'crypto', etc.
+```
+
+Use menu option **15** for a one-shot scan or option **16** for a continuous loop.
 
 ## Scripts
 
