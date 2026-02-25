@@ -52,8 +52,10 @@ def main():
     print("12. Continuous cross-platform arbitrage scanner")
     print("13. Scan Polymarket sports for same-event arbitrage ⚽")
     print("14. Continuous Polymarket sports arbitrage scanner ⚽")
+    print("15. Scan Kalshi ↔ Manifold cross-platform arbitrage 🎯")
+    print("16. Continuous Kalshi ↔ Manifold arbitrage scanner 🎯")
     
-    choice = input("\nEnter choice (1-14): ").strip()
+    choice = input("\nEnter choice (1-16): ").strip()
     
     if choice == "1":
         opportunities = bot.scan_all_markets_concurrent()
@@ -520,6 +522,60 @@ def main():
         poly_api = PolymarketAPI(api_key=Config.POLYMARKET_API_KEY)
         scanner = PolymarketSportsArbitrage(poly_api=poly_api, storage=storage)
         scanner.scan_continuous(interval=Config.POLYMARKET_SPORTS_SCAN_INTERVAL)
+
+    elif choice == "15":
+        # One-shot Kalshi ↔ Manifold cross-platform arbitrage scan
+        from manifold_api import ManifoldAPI
+        from manifold_arb import ManifoldArbitrage
+
+        print("\n" + "="*60)
+        print("🎯 KALSHI ↔ MANIFOLD CROSS-PLATFORM ARBITRAGE SCANNER")
+        print("="*60)
+        manifold_auth = 'API key set' if Config.MANIFOLD_API_KEY else 'read-only (no key)'
+        print(f"Manifold API: {manifold_auth}")
+        print(f"Sweepstakes only: {Config.MANIFOLD_SWEEPSTAKES_ONLY}")
+        print(f"Min profit: {Config.MANIFOLD_MIN_PROFIT_PERCENT}%")
+        print(f"Max bet: ${Config.MANIFOLD_MAX_BET_USD:.0f}")
+        print("✅ Manifold API fully accessible for US users (no restrictions)")
+        print("="*60 + "\n")
+
+        scanner = ManifoldArbitrage(kalshi_api=api, storage=storage)
+        opportunities = scanner.scan_opportunities()
+
+        if opportunities:
+            print(f"\n✅ Found {len(opportunities)} Kalshi ↔ Manifold opportunities:\n")
+            for i, opp in enumerate(opportunities, 1):
+                sweeps = '(Sweepcash 💰)' if opp['manifold_is_sweepstakes'] else '(Mana)'
+                print(f"{i}. {opp['kalshi_ticker']} ↔ Manifold {sweeps}")
+                print(f"   Kalshi: {opp['kalshi_title'][:60]}")
+                print(f"   Manifold: {opp['manifold_title'][:60]}")
+                print(f"   Match confidence: {opp['match_confidence']:.2%}")
+                print(f"   Strategy: {opp['strategy']}")
+                print(f"   Profit: {opp['profit_cents']}¢ ({opp['profit_percent']:.2f}%)")
+                print()
+        else:
+            print("\n📊 No Kalshi ↔ Manifold arbitrage opportunities found")
+
+    elif choice == "16":
+        # Continuous Kalshi ↔ Manifold arbitrage scanner
+        from manifold_api import ManifoldAPI
+        from manifold_arb import ManifoldArbitrage
+
+        print("\n" + "="*60)
+        print("🎯 CONTINUOUS KALSHI ↔ MANIFOLD ARBITRAGE SCANNER")
+        print("="*60)
+        manifold_auth = 'API key set' if Config.MANIFOLD_API_KEY else 'read-only (no key)'
+        print(f"Manifold API: {manifold_auth}")
+        print(f"Sweepstakes only: {Config.MANIFOLD_SWEEPSTAKES_ONLY}")
+        print(f"Min profit: {Config.MANIFOLD_MIN_PROFIT_PERCENT}%")
+        print(f"Max bet: ${Config.MANIFOLD_MAX_BET_USD:.0f}")
+        print(f"Scan interval: {Config.MANIFOLD_SCAN_INTERVAL}s")
+        print("✅ Manifold API fully accessible for US users (no restrictions)")
+        print(f"Press Ctrl+C to stop")
+        print("="*60 + "\n")
+
+        scanner = ManifoldArbitrage(kalshi_api=api, storage=storage)
+        scanner.scan_continuous()
 
     else:
         print("Invalid choice")

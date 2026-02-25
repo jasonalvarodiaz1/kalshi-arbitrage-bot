@@ -82,6 +82,15 @@ class Config:
     POLYMARKET_SPORTS_SCAN_INTERVAL = int(os.getenv('POLYMARKET_SPORTS_SCAN_INTERVAL', 45))  # Seconds between scans (30-60 recommended)
     POLYMARKET_SPORTS_MAX_POSITION_USD = float(os.getenv('POLYMARKET_SPORTS_MAX_POSITION_USD', 500.0))  # Conservative start — scale up after live validation
 
+    # Manifold Markets Configuration
+    MANIFOLD_API_KEY = os.getenv('MANIFOLD_API_KEY')  # Get from https://manifold.markets/profile → API tab
+    MANIFOLD_ENABLED = os.getenv('MANIFOLD_ENABLED', 'true').lower() == 'true'
+    MANIFOLD_SWEEPSTAKES_ONLY = os.getenv('MANIFOLD_SWEEPSTAKES_ONLY', 'true').lower() == 'true'  # Only scan real-money markets
+    MANIFOLD_MIN_PROFIT_PERCENT = float(os.getenv('MANIFOLD_MIN_PROFIT_PERCENT', 3.0))  # 3% min — no fees but AMM slippage
+    MANIFOLD_SCAN_INTERVAL = int(os.getenv('MANIFOLD_SCAN_INTERVAL', 90))  # Slower scan — AMM prices move slowly
+    MANIFOLD_MAX_BET_USD = float(os.getenv('MANIFOLD_MAX_BET_USD', 50.0))  # Conservative — Manifold liquidity is thin
+    MANIFOLD_CATEGORIES = os.getenv('MANIFOLD_CATEGORIES', 'all')  # 'all', 'politics', 'sports', etc.
+
     # Probability Trading
     MIN_EDGE_PERCENT = float(os.getenv('MIN_EDGE_PERCENT', 3.0))  # Minimum edge to trade
     KELLY_MULTIPLIER = float(os.getenv('KELLY_MULTIPLIER', 0.5))  # Half-Kelly default (conservative)
@@ -129,6 +138,14 @@ class Config:
         print(f"  Sports Arb Min Profit: {cls.POLYMARKET_SPORTS_MIN_PROFIT_PERCENT}%")
         print(f"  Sports Arb Scan Interval: {cls.POLYMARKET_SPORTS_SCAN_INTERVAL}s")
         print(f"  Sports Arb Max Position: ${cls.POLYMARKET_SPORTS_MAX_POSITION_USD:.2f}")
+        print(f"  Manifold Enabled: {cls.MANIFOLD_ENABLED}")
+        manifold_auth = 'API key set' if cls.MANIFOLD_API_KEY else 'read-only (no key)'
+        print(f"  Manifold Auth: {manifold_auth}")
+        print(f"  Manifold Sweepstakes Only: {cls.MANIFOLD_SWEEPSTAKES_ONLY}")
+        print(f"  Manifold Min Profit: {cls.MANIFOLD_MIN_PROFIT_PERCENT}%")
+        print(f"  Manifold Scan Interval: {cls.MANIFOLD_SCAN_INTERVAL}s")
+        print(f"  Manifold Max Bet: ${cls.MANIFOLD_MAX_BET_USD:.2f}")
+        print(f"  Manifold Categories: {cls.MANIFOLD_CATEGORIES}")
 
     @classmethod
     def load_private_key(cls) -> Optional[str]:
