@@ -204,9 +204,11 @@ class CrossPlatformArbitrage:
         # Use tag-filtered Gamma API fetch instead of fetching all markets
         categories_cfg = Config.POLYMARKET_CATEGORIES.strip().lower()
         poly_tags = [t.strip() for t in categories_cfg.split(',') if t.strip()] if categories_cfg != 'all' else ['sports', 'politics']
+        poly_min_liq = float(getattr(Config, 'CROSS_PLATFORM_POLY_MIN_LIQUIDITY', 1000.0))
+        poly_max_pages = int(getattr(Config, 'CROSS_PLATFORM_POLY_MAX_PAGES', 5))
         poly_markets: List[Dict] = []
         for tag in poly_tags:
-            tag_markets = self.poly_api.get_markets_for_tag(tag, min_liquidity=25.0)
+            tag_markets = self.poly_api.get_markets_for_tag(tag, min_liquidity=poly_min_liq, max_pages=poly_max_pages)
             poly_markets.extend(tag_markets)
         # De-duplicate by conditionId / id in case tags overlap
         seen_ids: set = set()
@@ -241,21 +243,28 @@ class CrossPlatformArbitrage:
             len(eligible), len(poly_markets), self.similarity_threshold,
         )
 
-        # Pre-compute normalized Polymarket titles
-        poly_normalized = [
-            (m, _normalize_title(m.get('question', '') or m.get('title', '')))
-            for m in poly_markets
-        ]
+        # Pre-compute normalized Polymarket titles + word sets for fast pre-filtering
+        _STOPWORDS = {'a', 'an', 'the', 'in', 'on', 'at', 'to', 'of', 'for',
+                      'by', 'or', 'and', 'be', 'is', 'are', 'will', 'does'}
+        poly_normalized = []
+        for m in poly_markets:
+            title = _normalize_title(m.get('question', '') or m.get('title', '') or '')
+            words = {w for w in title.split() if len(w) > 2 and w not in _STOPWORDS}
+            poly_normalized.append((m, title, words))
 
         pairs: List[Tuple[Dict, Dict]] = []
         for km in eligible:
-            k_title = _normalize_title(km.get('title', ''))
+            k_title = _normalize_title(km.get('title', '') or '')
             if not k_title:
                 continue
+            k_words = {w for w in k_title.split() if len(w) > 2 and w not in _STOPWORDS}
             best_score = 0.0
             best_pm = None
-            for pm, p_title in poly_normalized:
+            for pm, p_title, p_words in poly_normalized:
                 if not p_title:
+                    continue
+                # Fast word-overlap pre-filter: skip pairs with no shared keywords
+                if k_words and p_words and not (k_words & p_words):
                     continue
                 score = _similarity(k_title, p_title)
                 if score > best_score:
@@ -274,6 +283,7 @@ class CrossPlatformArbitrage:
         logger.info("Found %d matched market pairs", len(pairs))
         self._matched_pairs = pairs
         return pairs
+
 
     # ------------------------------------------------------------------
     # Price helpers

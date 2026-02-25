@@ -201,7 +201,7 @@ class PolymarketAPI:
         logger.info("Gamma API: fetched %d events for tag '%s'", len(all_events), tag)
         return all_events
 
-    def get_markets_for_tag(self, tag: str, min_liquidity: float = 25.0) -> List[Dict]:
+    def get_markets_for_tag(self, tag: str, min_liquidity: float = 25.0, max_pages: int = 20) -> List[Dict]:
         """Fetch active binary markets for a Gamma tag, normalized for the scanner.
 
         Extracts markets from events (``/events?tag=<tag>``), normalises the
@@ -211,7 +211,7 @@ class PolymarketAPI:
         the caller can do a cheap pre-filter before calling ``get_orderbook()``.
         """
         import json as _json
-        events = self.get_events_by_tag(tag)
+        events = self.get_events_by_tag(tag, max_pages=max_pages)
         markets: List[Dict] = []
         for event in events:
             for m in event.get('markets', []):

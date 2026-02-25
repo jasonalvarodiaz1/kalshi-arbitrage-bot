@@ -67,6 +67,14 @@ class Config:
     # Kalshi market page cap for cross-platform matching (200 markets/page).
     # Execution is blocked for US users anyway; this is purely a monitoring scan.
     CROSS_PLATFORM_KALSHI_MAX_PAGES = int(os.getenv('CROSS_PLATFORM_KALSHI_MAX_PAGES', 10))
+    # Min Polymarket liquidity (USD) for cross-platform matching.  Higher values
+    # return fewer markets and make the title-matching scan much faster.
+    # Default $1000 gives ~100-300 high-liquidity markets (vs 9000+ at $25).
+    CROSS_PLATFORM_POLY_MIN_LIQUIDITY = float(os.getenv('CROSS_PLATFORM_POLY_MIN_LIQUIDITY', 1000.0))
+    # Max Gamma API event-pages to fetch per tag for cross-platform matching
+    # (100 events/page → default 5 pages = 500 events ≈ 2000–4000 markets).
+    # Increase to scan more Polymarket markets at the cost of a longer match phase.
+    CROSS_PLATFORM_POLY_MAX_PAGES = int(os.getenv('CROSS_PLATFORM_POLY_MAX_PAGES', 5))
 
     # Polymarket Sports Arb
     POLYMARKET_FEE_PERCENT = float(os.getenv('POLYMARKET_FEE_PERCENT', 2.0))  # Polymarket winner fee (2%)
