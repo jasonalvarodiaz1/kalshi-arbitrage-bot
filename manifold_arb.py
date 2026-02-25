@@ -1,7 +1,14 @@
 import logging
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
+
+# Ensure UTF-8 output on Windows (cp1252 can't handle emoji in log messages)
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 from config import Config
 from api import KalshiAPI
