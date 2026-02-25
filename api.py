@@ -334,6 +334,89 @@ class KalshiAPI:
             print(f"📦 Fetched {len(all_markets)} total markets ({page} pages)")
         return all_markets
 
+    def get_events_with_markets(
+        self,
+        status: str = "open",
+        max_pages: int = 25,
+        skip_categories: Optional[set] = None,
+    ) -> List[Dict]:
+        """Fetch active markets via the ``/events`` endpoint.
+
+        The ``/markets`` listing is dominated by sports parlay multi-game bets.
+        By fetching events (with nested markets) and skipping unwanted categories
+        we can reach the politics / economics / science / etc. markets that the
+        plain ``/markets`` pagination buries under thousands of parlays.
+
+        Args:
+            status: Event status filter (default 'open').
+            max_pages: Maximum pages to fetch (200 events/page, each with nested markets).
+            skip_categories: Categories to exclude (e.g. ``{'Sports'}``).
+
+        Returns:
+            Flat list of market dicts, each augmented with ``_category`` and
+            ``_event_title`` from the parent event.
+        """
+        self._ensure_auth()
+        if skip_categories is None:
+            skip_categories = set()
+
+        all_markets: List[Dict] = []
+        cursor = None
+        path_prefix = urlparse(self.BASE_URL).path.rstrip('/')
+
+        for page in range(1, max_pages + 1):
+            try:
+                path = f"{path_prefix}/events"
+                headers = self._signed_headers('GET', path)
+                params: Dict = {
+                    'status': status,
+                    'limit': 200,
+                    'with_nested_markets': 'true',
+                }
+                if cursor:
+                    params['cursor'] = cursor
+
+                response = self._request_with_retry(
+                    'GET', f"{self.BASE_URL}/events", params=params, headers=headers if headers else None
+                )
+                if response is None or response.status_code != 200:
+                    logger.warning("Events page %d failed (status=%s)", page,
+                                   getattr(response, 'status_code', None))
+                    break
+
+                data = response.json()
+                events = data.get('events', [])
+                cursor = data.get('cursor')
+
+                for event in events:
+                    cat = event.get('category', 'unknown')
+                    if cat in skip_categories:
+                        continue
+                    for mkt in event.get('markets', []):
+                        mkt_status = mkt.get('status', '')
+                        if mkt_status not in ('active', 'open'):
+                            continue
+                        # Skip sports parlay tickers that leaked through
+                        if 'MULTIGAME' in mkt.get('ticker', ''):
+                            continue
+                        mkt['_category'] = cat
+                        mkt['_event_title'] = event.get('title', '')
+                        all_markets.append(mkt)
+
+                if not cursor or not events:
+                    break
+                time.sleep(Config.RATE_LIMIT_DELAY)
+
+            except Exception as exc:
+                logger.error("Error fetching events page %d: %s", page, exc)
+                break
+
+        logger.info(
+            "Fetched %d non-sports markets from %d event pages (skipped: %s)",
+            len(all_markets), page, skip_categories or 'none',
+        )
+        return all_markets
+
     def get_event(self, event_ticker: str) -> Optional[Dict]:
         """Get event details and its markets."""
         self._ensure_auth()

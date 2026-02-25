@@ -90,6 +90,7 @@ class Config:
     MANIFOLD_SCAN_INTERVAL = int(os.getenv('MANIFOLD_SCAN_INTERVAL', 90))  # Slower scan — AMM prices move slowly
     MANIFOLD_MAX_BET_USD = float(os.getenv('MANIFOLD_MAX_BET_USD', 50.0))  # Conservative — Manifold liquidity is thin
     MANIFOLD_CATEGORIES = os.getenv('MANIFOLD_CATEGORIES', 'all')  # 'all', 'politics', 'sports', etc.
+    MANIFOLD_MATCH_THRESHOLD = float(os.getenv('MANIFOLD_MATCH_THRESHOLD', 0.80))  # Lower than cross-platform (0.85) — Manifold titles differ more
 
     # Probability Trading
     MIN_EDGE_PERCENT = float(os.getenv('MIN_EDGE_PERCENT', 3.0))  # Minimum edge to trade
@@ -146,6 +147,7 @@ class Config:
         print(f"  Manifold Scan Interval: {cls.MANIFOLD_SCAN_INTERVAL}s")
         print(f"  Manifold Max Bet: ${cls.MANIFOLD_MAX_BET_USD:.2f}")
         print(f"  Manifold Categories: {cls.MANIFOLD_CATEGORIES}")
+        print(f"  Manifold Match Threshold: {cls.MANIFOLD_MATCH_THRESHOLD}")
 
     @classmethod
     def load_private_key(cls) -> Optional[str]:

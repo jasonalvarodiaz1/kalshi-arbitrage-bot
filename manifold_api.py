@@ -137,10 +137,11 @@ class ManifoldAPI:
         - closeTime: unix timestamp (ms) when market closes
         - volume: total volume traded
         - totalLiquidity: total liquidity in the pool
-        - token: 'MANA' or 'CASH' (CASH = Sweepstakes/real money)
+        - token: 'MANA', 'CASH', or 'CASH_AND_MANA' (sweepstakes-eligible)
         """
         try:
             params: Dict = {
+                'term': '',
                 'limit': limit,
                 'sort': sort,
                 'filter': filter_,
