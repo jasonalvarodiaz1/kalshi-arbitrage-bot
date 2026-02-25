@@ -1,7 +1,7 @@
 import logging
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
 # Ensure UTF-8 output on Windows (cp1252 can't handle emoji in log messages)
@@ -137,6 +137,44 @@ class ManifoldArbitrage:
         return False
 
     # ------------------------------------------------------------------
+    # Settlement time helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_kalshi_close(market: Dict) -> Optional[datetime]:
+        """Parse the close/expiration time from a Kalshi market dict.
+
+        Prefers ``close_time`` (when trading ends and the bracket settles)
+        over ``expected_expiration_time`` (which can be years away for
+        early-close-eligible markets).
+        """
+        for field in ('close_time', 'expected_expiration_time'):
+            raw = market.get(field, '')
+            if not raw or raw.startswith('0001') or raw.startswith('2099'):
+                continue
+            try:
+                return datetime.fromisoformat(raw.replace('Z', '+00:00'))
+            except (ValueError, TypeError):
+                continue
+        return None
+
+    @staticmethod
+    def _within_settle_window(market: Dict, cutoff: datetime) -> bool:
+        """Return True if Kalshi market settles before *cutoff*."""
+        ct = ManifoldArbitrage._parse_kalshi_close(market)
+        if ct is None:
+            return False  # Unknown close = skip (conservative)
+        return ct <= cutoff
+
+    @staticmethod
+    def _manifold_within_settle_window(market: Dict, cutoff_ms: int) -> bool:
+        """Return True if Manifold market closes before *cutoff_ms* (epoch ms)."""
+        close_ms = market.get('closeTime')
+        if close_ms is None:
+            return False
+        return close_ms <= cutoff_ms
+
+    # ------------------------------------------------------------------
     # Market matching
     # ------------------------------------------------------------------
 
@@ -224,6 +262,30 @@ class ManifoldArbitrage:
             len(eligible_manifold),
             ' sweepstakes' if sweeps_filter else '',
         )
+
+        # ---- Settlement time filter ----
+        # Skip markets that close too far in the future (user wants quick turnaround)
+        max_settle_days = Config.MANIFOLD_MAX_SETTLE_DAYS
+        now = datetime.now(timezone.utc)
+
+        if max_settle_days > 0:
+            cutoff = now + timedelta(days=max_settle_days)
+            cutoff_ms = int(cutoff.timestamp() * 1000)  # Manifold uses epoch ms
+
+            pre_kalshi = len(kalshi_markets)
+            kalshi_markets = [m for m in kalshi_markets if self._within_settle_window(m, cutoff)]
+
+            pre_manifold = len(eligible_manifold)
+            eligible_manifold = [
+                m for m in eligible_manifold
+                if self._manifold_within_settle_window(m, cutoff_ms)
+            ]
+
+            logger.info(
+                "Settlement filter (max %.1f days): Kalshi %d->%d, Manifold %d->%d",
+                max_settle_days, pre_kalshi, len(kalshi_markets),
+                pre_manifold, len(eligible_manifold),
+            )
 
         # Category pre-filter for Kalshi side
         categories_cfg = Config.MANIFOLD_CATEGORIES.strip().lower()
@@ -393,6 +455,17 @@ class ManifoldArbitrage:
             f" + {manifold_side.upper()}@Manifold({manifold_price}c)"
         )
 
+        # Compute days to settlement for tracking
+        kalshi_close = self._parse_kalshi_close(kalshi_market)
+        manifold_close_ms = manifold_market.get('closeTime')
+        now_utc = datetime.now(timezone.utc)
+        if kalshi_close:
+            days_to_settle = max(0, (kalshi_close - now_utc).total_seconds() / 86400)
+        elif manifold_close_ms:
+            days_to_settle = max(0, (manifold_close_ms / 1000 - now_utc.timestamp()) / 86400)
+        else:
+            days_to_settle = -1
+
         return {
             'type': 'kalshi_manifold',
             'kalshi_ticker': kalshi_ticker,
@@ -408,6 +481,7 @@ class ManifoldArbitrage:
             'total_cost': total_cost,
             'profit_cents': profit_cents,
             'profit_percent': round(profit_percent, 2),
+            'days_to_settle': round(days_to_settle, 1),
             'manifold_is_sweepstakes': self._is_sweepstakes(manifold_market),
             'manifold_liquidity': manifold_market.get('totalLiquidity', 0),
             'strategy': strategy,
@@ -445,9 +519,10 @@ class ManifoldArbitrage:
             if opp:
                 opportunities.append(opp)
                 logger.info(
-                    "[OK] MANIFOLD ARB: %s <-> Manifold(%s) -- %sc (%.2f%%)",
+                    "[OK] MANIFOLD ARB: %s <-> Manifold(%s) -- %sc (%.2f%%) settles in %.1fd",
                     opp['kalshi_ticker'], opp['manifold_id'],
                     opp['profit_cents'], opp['profit_percent'],
+                    opp.get('days_to_settle', -1),
                 )
                 self.notifier.notify_opportunity(opp)
                 if self.storage:
@@ -481,8 +556,8 @@ class ManifoldArbitrage:
                 'trade_id', 'timestamp', 'kalshi_ticker', 'manifold_id',
                 'kalshi_title', 'manifold_title', 'match_confidence',
                 'kalshi_side', 'kalshi_price', 'manifold_side', 'manifold_price',
-                'total_cost', 'profit_cents', 'profit_percent', 'strategy',
-                'bet_size_usd', 'status', 'settled_profit',
+                'total_cost', 'profit_cents', 'profit_percent', 'days_to_settle',
+                'strategy', 'bet_size_usd', 'status', 'settled_profit',
             ])
 
     def execute_paper_trade(self, opportunity: Dict) -> Optional[Dict]:
@@ -515,6 +590,7 @@ class ManifoldArbitrage:
             'total_cost': opportunity['total_cost'],
             'profit_cents': opportunity['profit_cents'],
             'profit_percent': opportunity['profit_percent'],
+            'days_to_settle': opportunity.get('days_to_settle', -1),
             'strategy': opportunity['strategy'],
             'bet_size_usd': bet_size,
             'status': 'open',
@@ -543,8 +619,8 @@ class ManifoldArbitrage:
                     'trade_id', 'timestamp', 'kalshi_ticker', 'manifold_id',
                     'kalshi_title', 'manifold_title', 'match_confidence',
                     'kalshi_side', 'kalshi_price', 'manifold_side', 'manifold_price',
-                    'total_cost', 'profit_cents', 'profit_percent', 'strategy',
-                    'bet_size_usd', 'status', 'settled_profit',
+                    'total_cost', 'profit_cents', 'profit_percent', 'days_to_settle',
+                    'strategy', 'bet_size_usd', 'status', 'settled_profit',
                 ]])
         except Exception as exc:
             logger.warning("Failed to write paper trade CSV: %s", exc)
@@ -608,10 +684,12 @@ class ManifoldArbitrage:
                     if trades:
                         print(f"\nPAPER TRADED {len(trades)} opportunities:")
                         for t in trades:
-                            print(
+                            days = t.get('days_to_settle', -1)
+                        days_str = f"{days:.0f}d" if days >= 0 else "?"
+                        print(
                                 f"  [{t['trade_id']}] {t['strategy']} | "
                                 f"cost={t['total_cost']}c profit={t['profit_cents']}c "
-                                f"({t['profit_percent']:.2f}%) bet=${t['bet_size_usd']:.2f}"
+                                f"({t['profit_percent']:.2f}%) settle={days_str} bet=${t['bet_size_usd']:.2f}"
                             )
                         summary = self.get_paper_summary()
                         print(f"\n  Session totals: {summary['total']} trades, "
