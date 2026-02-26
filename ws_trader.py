@@ -106,7 +106,7 @@ class WSConvergenceTrader:
         # Rule 4: Hard caps (% of bankroll, not fixed dollar amounts)
         self.max_event_pct = 0.05                    # 5% of bankroll per event
         self.stop_loss_pct = 0.15                    # 15% drawdown from starting equity → halt
-        self.starting_balance = 171.18               # starting equity for drawdown tracking
+        self.starting_balance = 125.99               # updated from settlement analysis (2026-02-26)
         self.stop_loss_triggered = False             # True after stop-loss fires; clears on recovery
 
         # Rule 5: CPPI — dynamic floor protection
@@ -151,6 +151,7 @@ class WSConvergenceTrader:
         self.max_contracts = 15                      # Hard cap: 15 contracts per trade
         self.min_price_cents = 10                  # Minimum price to consider
         self.max_yes_price_cents = 30              # Max 30c for YES (risk/reward filter)
+        self.max_no_price_cents = 45               # Max 45c for NO — expensive NO trades have 20% WR per settlement data
         self.min_book_depth = 5                    # Need 5+ real depth — no thin books
         self.atm_buffer_brackets = 1               # Skip the ATM bracket (model worst there)
 
@@ -588,7 +589,8 @@ class WSConvergenceTrader:
         all_markets = btc + eth + doge + xrp
 
         # Also fetch 15-minute binary up/down markets
-        if not disable_crypto:
+        disable_binary = getattr(self.config, 'DISABLE_BINARY_15M', True)
+        if not disable_crypto and not disable_binary:
             for series_15m in self._15m_series:
                 try:
                     m15 = self.api.get_all_markets(status="open", series_ticker=series_15m)
@@ -693,68 +695,72 @@ class WSConvergenceTrader:
 
         # ── Weather market scanning ─────────────────────────────────────
         weather_count = 0
-        for ws_series, ws_info in self.weather_series.items():
-            try:
-                w_markets = self.api.get_all_markets(status="open", series_ticker=ws_series)
-                if not w_markets:
-                    continue
-            except Exception:
-                continue
-
-            w_events: Dict[str, List[Dict]] = {}
-            for m in w_markets:
-                et = m.get('event_ticker', '')
-                w_events.setdefault(et, []).append(m)
-
-            for w_event, w_brackets in w_events.items():
-                ct = w_brackets[0].get('close_time', '')
-                mins = self._minutes_until(ct) if ct else None
-                if mins is None or mins < 60 or mins > self.weather_max_expiry_hours * 60:
-                    continue  # weather: skip < 1h or > 48h
-
-                # Extract event date from event_ticker: KXHIGHLAX-26FEB18 → 26FEB18
-                parts = w_event.split('-')
-                event_date = parts[-1] if len(parts) >= 2 else ''
-
-                for b in w_brackets:
-                    ticker = b.get('ticker', '')
-                    if not ticker:
+        disable_weather = getattr(self.config, 'DISABLE_WEATHER', True)
+        if not disable_weather:
+            for ws_series, ws_info in self.weather_series.items():
+                try:
+                    w_markets = self.api.get_all_markets(status="open", series_ticker=ws_series)
+                    if not w_markets:
                         continue
+                except Exception:
+                    continue
 
-                    fs = b.get('floor_strike')
-                    cs = b.get('cap_strike')
-                    strike_type = b.get('strike_type', 'between')
+                w_events: Dict[str, List[Dict]] = {}
+                for m in w_markets:
+                    et = m.get('event_ticker', '')
+                    w_events.setdefault(et, []).append(m)
 
-                    self.market_meta[ticker] = {
-                        'floor_strike': fs,
-                        'cap_strike': cs,
-                        'event_ticker': w_event,
-                        'close_time': ct,
-                        'asset': ws_info['city'],
-                        'market_type': 'weather',
-                        'weather_series': ws_series,
-                        'strike_type': strike_type,
-                        'event_date': event_date,
-                    }
-                    tickers_to_sub.append(ticker)
-                    weather_count += 1
+                for w_event, w_brackets in w_events.items():
+                    ct = w_brackets[0].get('close_time', '')
+                    mins = self._minutes_until(ct) if ct else None
+                    if mins is None or mins < 60 or mins > self.weather_max_expiry_hours * 60:
+                        continue  # weather: skip < 1h or > 48h
 
-                    # Seed ticker_data from REST bid/ask (WS may not deliver updates for thin markets)
-                    yb = b.get('yes_bid', 0) or 0
-                    ya = b.get('yes_ask', 0) or 0
-                    if yb > 0 or ya > 0:
-                        if ticker not in self.ticker_data or not self.ticker_data[ticker].get('yes_bid'):
-                            self.ticker_data[ticker] = {
-                                'yes_bid': yb, 'yes_ask': ya,
-                                'price': b.get('price', 0), 'volume': b.get('volume', 0),
-                                'open_interest': b.get('open_interest', 0),
-                            }
+                    # Extract event date from event_ticker: KXHIGHLAX-26FEB18 → 26FEB18
+                    parts = w_event.split('-')
+                    event_date = parts[-1] if len(parts) >= 2 else ''
 
-            # Pre-fetch forecast for this series
-            self._fetch_weather_forecast(ws_series)
+                    for b in w_brackets:
+                        ticker = b.get('ticker', '')
+                        if not ticker:
+                            continue
 
-        if weather_count > 0:
-            logger.info("Weather: %d tickers across %d series", weather_count, len(self.weather_series))
+                        fs = b.get('floor_strike')
+                        cs = b.get('cap_strike')
+                        strike_type = b.get('strike_type', 'between')
+
+                        self.market_meta[ticker] = {
+                            'floor_strike': fs,
+                            'cap_strike': cs,
+                            'event_ticker': w_event,
+                            'close_time': ct,
+                            'asset': ws_info['city'],
+                            'market_type': 'weather',
+                            'weather_series': ws_series,
+                            'strike_type': strike_type,
+                            'event_date': event_date,
+                        }
+                        tickers_to_sub.append(ticker)
+                        weather_count += 1
+
+                        # Seed ticker_data from REST bid/ask (WS may not deliver updates for thin markets)
+                        yb = b.get('yes_bid', 0) or 0
+                        ya = b.get('yes_ask', 0) or 0
+                        if yb > 0 or ya > 0:
+                            if ticker not in self.ticker_data or not self.ticker_data[ticker].get('yes_bid'):
+                                self.ticker_data[ticker] = {
+                                    'yes_bid': yb, 'yes_ask': ya,
+                                    'price': b.get('price', 0), 'volume': b.get('volume', 0),
+                                    'open_interest': b.get('open_interest', 0),
+                                }
+
+                # Pre-fetch forecast for this series
+                self._fetch_weather_forecast(ws_series)
+
+            if weather_count > 0:
+                logger.info("Weather: %d tickers across %d series", weather_count, len(self.weather_series))
+        else:
+            logger.info("Weather trading disabled (DISABLE_WEATHER=true)")
 
         logger.info("Found %d total tickers (crypto + weather)", len(tickers_to_sub))
         return tickers_to_sub
@@ -1028,6 +1034,8 @@ class WSConvergenceTrader:
 
         # ── Dispatch weather markets to dedicated handler ──
         if market_type == 'weather':
+            if getattr(self.config, 'DISABLE_WEATHER', True):
+                return None
             mins_left = self._minutes_until(meta['close_time'])
             if mins_left is None or mins_left < 60 or mins_left > self.weather_max_expiry_hours * 60:
                 return None
@@ -1044,6 +1052,8 @@ class WSConvergenceTrader:
 
         # ── Dispatch binary up/down markets to dedicated handler ──
         if market_type == 'binary_updown':
+            if getattr(self.config, 'DISABLE_BINARY_15M', True):
+                return None
             return self._evaluate_binary_updown(ticker, meta, current_price, mins_left)
 
         floor_s = meta['floor_strike']
@@ -1152,7 +1162,7 @@ class WSConvergenceTrader:
 
         if is_atm_no:
             pass  # Skip ATM/near-ATM NO trades entirely
-        elif no_ask >= self.min_price_cents and no_ask < 95 and no_depth >= self.min_book_depth:
+        elif no_ask >= self.min_price_cents and no_ask <= self.max_no_price_cents and no_depth >= self.min_book_depth:
             implied_prob_no = no_ask / 100.0
             edge_no = (model_prob_no - implied_prob_no) * 100
             min_edge = self.min_edge_pct
@@ -1972,6 +1982,9 @@ class WSConvergenceTrader:
                      self.order_timeout_secs)
         logger.info("Max exposure: $%.2f | Max trades/event: %d",
                      self.max_total_exposure, self.max_trades_per_event)
+        logger.info("Weather trading: %s", "DISABLED" if getattr(self.config, 'DISABLE_WEATHER', True) else "enabled")
+        logger.info("Binary 15m trading: %s", "DISABLED" if getattr(self.config, 'DISABLE_BINARY_15M', True) else "enabled")
+        logger.info("Crypto NO max price: %d¢", self.max_no_price_cents)
         logger.info("=" * 70)
 
         self._running = True
@@ -2244,15 +2257,16 @@ class WSConvergenceTrader:
                     # Weather markets may get sparse WS updates, so evaluate
                     # all weather tickers on each re-scan using REST bid/ask data
                     weather_opps = 0
-                    for w_ticker, w_meta in self.market_meta.items():
-                        if w_meta.get('market_type') != 'weather':
-                            continue
-                        opp = self.evaluate_opportunity(w_ticker)
-                        if opp:
-                            weather_opps += 1
-                            self.execute_trade(opp, balance)
-                    if weather_opps > 0:
-                        logger.info("Weather scan found %d opportunities", weather_opps)
+                    if not getattr(self.config, 'DISABLE_WEATHER', True):
+                        for w_ticker, w_meta in self.market_meta.items():
+                            if w_meta.get('market_type') != 'weather':
+                                continue
+                            opp = self.evaluate_opportunity(w_ticker)
+                            if opp:
+                                weather_opps += 1
+                                self.execute_trade(opp, balance)
+                        if weather_opps > 0:
+                            logger.info("Weather scan found %d opportunities", weather_opps)
 
                     # Clean up traded_tickers and event_trade_count for OLD events only
                     # Never re-trade a ticker within the same active event
