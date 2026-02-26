@@ -22,6 +22,8 @@ class Config:
     LIVE_TRADING_ENABLED = os.getenv('ENABLE_LIVE_TRADING', 'false').lower() == 'true'
     WEATHER_LIVE_ONLY = os.getenv('WEATHER_LIVE_ONLY', 'true').lower() == 'true'  # Only live-trade weather, paper everything else
     DISABLE_CRYPTO = os.getenv('DISABLE_CRYPTO', 'false').lower() == 'true'  # Skip crypto scanning entirely
+    DISABLE_WEATHER = os.getenv('DISABLE_WEATHER', 'true').lower() == 'true'  # Disable weather trading (42.3% WR, -$45.19 P&L — no model edge)
+    DISABLE_BINARY_15M = os.getenv('DISABLE_BINARY_15M', 'true').lower() == 'true'  # Disable binary 15-minute markets (22.2% WR, -$35.38 P&L — model fails badly)
     MAX_TRADE_USD = float(os.getenv('MAX_TRADE_USD', 100.0))
     
     # Notification Configuration
@@ -151,6 +153,8 @@ class Config:
         print(f"  Manifold Match Threshold: {cls.MANIFOLD_MATCH_THRESHOLD}")
         settle = cls.MANIFOLD_MAX_SETTLE_DAYS
         print(f"  Manifold Max Settle: {settle} days" if settle > 0 else "  Manifold Max Settle: no limit")
+        print(f"  Disable Weather: {cls.DISABLE_WEATHER}")
+        print(f"  Disable Binary 15m: {cls.DISABLE_BINARY_15M}")
 
     @classmethod
     def load_private_key(cls) -> Optional[str]:
