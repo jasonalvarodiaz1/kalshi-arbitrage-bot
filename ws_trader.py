@@ -151,7 +151,7 @@ class WSConvergenceTrader:
         self.max_contracts = 15                      # Hard cap: 15 contracts per trade
         self.min_price_cents = 10                  # Minimum price to consider
         self.max_yes_price_cents = 30              # Max 30c for YES (risk/reward filter)
-        self.max_no_price_cents = 45               # Max 45c for NO — expensive NO trades have 20% WR per settlement data
+        self.max_no_price_cents = 85               # Max 85c for NO — old 45c cap was set on data contaminated by adjacent-bracket bug (now fixed)
         self.min_book_depth = 5                    # Need 5+ real depth — no thin books
         self.atm_buffer_brackets = 1               # Skip the ATM bracket (model worst there)
 
@@ -1153,12 +1153,12 @@ class WSConvergenceTrader:
         is_atm_no = False
         if floor_s is not None and cap_s is not None:
             bracket_width = cap_s - floor_s
-            # Skip if current price is within 2 bracket widths of this bracket
+            # Skip only if price is inside the bracket or immediately adjacent (1x width buffer)
             dist_to_bracket = min(abs(current_price - floor_s), abs(current_price - cap_s))
             if current_price >= floor_s and current_price < cap_s:
                 dist_to_bracket = 0  # price is IN the bracket
-            if dist_to_bracket < bracket_width * 2.0:
-                is_atm_no = True  # ATM buffer (2x bracket width) — model unreliable near ATM
+            if dist_to_bracket < bracket_width * 1.0:
+                is_atm_no = True  # ATM buffer (1x bracket width) — model unreliable in/adjacent to current bracket
 
         if is_atm_no:
             pass  # Skip ATM/near-ATM NO trades entirely
