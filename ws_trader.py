@@ -1147,7 +1147,15 @@ class WSConvergenceTrader:
                 }
 
         # Check NO opportunity — prefer cheap NO on far-OTM brackets
-        model_prob_no = 1.0 - model_prob
+        # Fat-tail correction: crypto returns have 3-5x excess kurtosis vs Gaussian.
+        # When model P(in bracket) is tiny (<10%), the actual probability is ~3x higher
+        # due to fat tails. Scale up before computing NO edge to avoid overconfidence.
+        p_yes_for_no = model_prob
+        if p_yes_for_no < 0.10:          # far-OTM bracket: fat tails dominate
+            p_yes_for_no = min(p_yes_for_no * 3.0, 0.20)
+        elif p_yes_for_no < 0.20:        # moderate OTM: mild correction
+            p_yes_for_no = min(p_yes_for_no * 1.5, 0.25)
+        model_prob_no = 1.0 - p_yes_for_no
 
         # SKIP ATM and near-ATM brackets for NO too — model is unreliable there
         is_atm_no = False
@@ -1162,6 +1170,8 @@ class WSConvergenceTrader:
 
         if is_atm_no:
             pass  # Skip ATM/near-ATM NO trades entirely
+        elif no_ask > 70 and mins_left < 15:
+            pass  # Skip expensive NO (<15 min left) — log-normal underestimates fat-tail moves at short horizons
         elif no_ask >= self.min_price_cents and no_ask <= self.max_no_price_cents and no_depth >= self.min_book_depth:
             implied_prob_no = no_ask / 100.0
             edge_no = (model_prob_no - implied_prob_no) * 100
@@ -1178,6 +1188,9 @@ class WSConvergenceTrader:
                 min_edge = max(min_edge, 8.0)                  # near-ATM: need 8%+ edge
             else:
                 min_edge = max(min_edge, 10.0)                 # expensive NO (60c+): need 10%+ edge
+            # Short-expiry premium: within 20 min, demand +3% more edge (models are noisier near expiry)
+            if mins_left < 20:
+                min_edge += 3.0
 
             # Also require high model confidence for NO bets
             min_conf_no = 0.60  # must be 60%+ confident in NO
