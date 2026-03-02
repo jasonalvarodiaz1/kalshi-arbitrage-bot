@@ -2172,12 +2172,15 @@ class WSConvergenceTrader:
                                  balance, drawdown_pct, cppi_max,
                                  {k: round(v, 2) for k, v in self.asset_exposure.items()} if self.asset_exposure else '{}')
 
-                    # Debug: sample a few tickers to see why no opps
+                    # Debug: sample tickers and show exactly which filter blocks each one
                     if opps_found == 0 and self.market_meta:
                         no_liq_count = 0
                         no_pass_edge = 0
                         no_pass_conf = 0
-                        sample_count = 0
+                        reject_counts = {'atm': 0, 'short_exp': 0, 'edge': 0, 'conf': 0, 'cap': 0, 'depth': 0}
+                        best_edge = -999.0
+                        best_tk_line = None
+                        sample_lines = []
                         for sample_tk in list(self.market_meta.keys()):
                             meta_s = self.market_meta[sample_tk]
                             asset_s = meta_s['asset']
@@ -2188,10 +2191,8 @@ class WSConvergenceTrader:
                             if mins_s is None or mins_s < self.min_expiry_minutes or mins_s > self.max_expiry_minutes:
                                 continue
                             ob_s = self.orderbooks.get(sample_tk, {})
-                            # Derive NO ask from YES bids (orderbook levels are BIDS)
                             yes_bids_s = ob_s.get('yes', [])
                             td_s = self.ticker_data.get(sample_tk, {})
-                            # Prefer orderbook YES bid, fall back to ticker
                             yb_s = max(p for p, q in yes_bids_s) if yes_bids_s else 0
                             if not yb_s:
                                 yb_s = td_s.get('yes_bid', 0) or 0
@@ -2201,34 +2202,85 @@ class WSConvergenceTrader:
                                 for p, q in yes_bids_s:
                                     if p == yb_s:
                                         no_depth_s = q
-                            if no_ask_s >= 4 and no_depth_s >= self.min_book_depth:
-                                no_liq_count += 1
-                                fs = meta_s['floor_strike']
-                                cs = meta_s['cap_strike']
-                                iv_s = self.calibrated_vol.get(meta_s['event_ticker'])
-                                mp_s = self.bracket_probability(price_s, fs, cs, mins_s, asset_s, iv_s)
-                                mp_no = 1.0 - mp_s
-                                edge_s = (mp_no - no_ask_s / 100.0) * 100
-                                me = self.min_edge_pct
-                                if no_ask_s <= 25 and mp_no >= 0.88:
-                                    me = max(4.0, self.min_edge_pct)
-                                elif no_ask_s <= 40:
-                                    me = max(me, 6.0)
-                                elif no_ask_s <= 60:
-                                    me = max(me, 8.0)
-                                else:
-                                    me = max(me, 10.0)
-                                if edge_s >= me:
-                                    no_pass_edge += 1
-                                if mp_no >= self.min_confidence:
-                                    no_pass_conf += 1
-                                if sample_count < 5:
-                                    logger.info("  DEBUG %s: no=%dc d=%d mp_no=%.0f%% edge=%.1f%% me=%.1f%% conf=%s",
-                                                 sample_tk, no_ask_s, no_depth_s, mp_no*100, edge_s, me,
-                                                 'Y' if mp_no >= self.min_confidence else 'N')
-                                    sample_count += 1
-                        logger.info("  DEBUG summary: %d tickers w/NO liq, %d pass edge, %d pass confidence",
-                                     no_liq_count, no_pass_edge, no_pass_conf)
+                            if no_ask_s < 4 or no_depth_s < self.min_book_depth:
+                                if no_ask_s >= 4:
+                                    reject_counts['depth'] += 1
+                                continue
+                            no_liq_count += 1
+                            fs = meta_s['floor_strike']
+                            cs = meta_s['cap_strike']
+                            iv_s = self.calibrated_vol.get(meta_s['event_ticker'])
+                            mp_s = self.bracket_probability(price_s, fs, cs, mins_s, asset_s, iv_s)
+
+                            # Apply same fat-tail correction as evaluate_opportunity
+                            p_yes_ft = mp_s
+                            if p_yes_ft < 0.10:
+                                p_yes_ft = min(p_yes_ft * 3.0, 0.20)
+                            elif p_yes_ft < 0.20:
+                                p_yes_ft = min(p_yes_ft * 1.5, 0.25)
+                            mp_no = 1.0 - p_yes_ft
+
+                            edge_s = (mp_no - no_ask_s / 100.0) * 100
+                            me = self.min_edge_pct
+                            if no_ask_s <= 25 and mp_no >= 0.88:
+                                me = max(4.0, self.min_edge_pct)
+                            elif no_ask_s <= 40:
+                                me = max(me, 6.0)
+                            elif no_ask_s <= 60:
+                                me = max(me, 8.0)
+                            else:
+                                me = max(me, 10.0)
+                            if mins_s < 20:
+                                me += 3.0
+
+                            # ATM buffer check (mirrors evaluate_opportunity)
+                            is_atm_s = False
+                            if fs is not None and cs is not None:
+                                bw = cs - fs
+                                dist_s = min(abs(price_s - fs), abs(price_s - cs))
+                                if price_s >= fs and price_s < cs:
+                                    dist_s = 0
+                                if dist_s < bw * 1.0:
+                                    is_atm_s = True
+
+                            # Determine rejection reason
+                            if is_atm_s:
+                                reason = 'ATM'
+                                reject_counts['atm'] += 1
+                            elif no_ask_s > 70 and mins_s < 15:
+                                reason = 'SHORT+EXP'
+                                reject_counts['short_exp'] += 1
+                            elif no_ask_s > self.max_no_price_cents:
+                                reason = 'CAP'
+                                reject_counts['cap'] += 1
+                            elif mp_no < self.min_confidence:
+                                reason = 'CONF'
+                                reject_counts['conf'] += 1
+                            elif edge_s < me:
+                                reason = f'EDGE({edge_s:.1f}<{me:.0f})'
+                                reject_counts['edge'] += 1
+                            else:
+                                reason = 'PASS'
+                                no_pass_edge += 1
+
+                            if mp_no >= self.min_confidence:
+                                no_pass_conf += 1
+
+                            if edge_s > best_edge:
+                                best_edge = edge_s
+                                best_tk_line = f"  BEST  {sample_tk}: no={no_ask_s}c d={no_depth_s} mp_no={mp_no*100:.0f}% edge={edge_s:.1f}% me={me:.0f}% mins={mins_s:.0f} [{reason}]"
+
+                            if len(sample_lines) < 4:
+                                sample_lines.append(f"  DEBUG {sample_tk}: no={no_ask_s}c mp_no={mp_no*100:.0f}% edge={edge_s:.1f}% me={me:.0f}% mins={mins_s:.0f} [{reason}]")
+
+                        for line in sample_lines:
+                            logger.info(line)
+                        if best_tk_line:
+                            logger.info(best_tk_line)
+                        logger.info("  DEBUG summary: %d w/liq | block: atm=%d short=%d edge=%d conf=%d cap=%d | pass=%d",
+                                     no_liq_count, reject_counts['atm'], reject_counts['short_exp'],
+                                     reject_counts['edge'], reject_counts['conf'], reject_counts['cap'],
+                                     no_pass_edge)
 
                     last_status = now
                     updates_processed = 0
