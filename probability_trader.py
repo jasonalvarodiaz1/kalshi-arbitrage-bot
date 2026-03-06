@@ -24,16 +24,20 @@ logger = logging.getLogger('kalshi_bot')
 class ProbabilityTrader:
     """Probability-based trading strategy for crypto interval markets."""
     
-    def __init__(self, api, config=None):
+    def __init__(self, api, config=None, price_feed=None):
         """
         Initialize probability trader.
         
         Args:
             api: KalshiAPI instance
             config: Config class (optional, uses global Config if not provided)
+            price_feed: Optional CryptoPriceFeed instance for real-time prices.
+                        Falls back to HTTP polling when None or when the feed
+                        price is stale (older than Config.PRICE_CACHE_SECONDS).
         """
         self.api = api
         self.config = config or Config
+        self.price_feed = price_feed
         self.price_cache = {}  # {asset: (price, timestamp)}
         
         # Default realized volatility estimates (15-min timeframe)
@@ -51,52 +55,69 @@ class ProbabilityTrader:
     
     def get_current_price(self, asset: str) -> Optional[float]:
         """
-        Fetch current price from CoinGecko with caching.
-        
-        Args:
-            asset: 'BTC' or 'ETH'
-            
+        Return the current price for *asset* ('BTC' or 'ETH') in USD.
+
+        Priority:
+        1. WebSocket feed (``self.price_feed``) when connected and price is
+           fresh (age < ``PRICE_CACHE_SECONDS``).
+        2. Local HTTP cache if still within TTL.
+        3. CoinGecko HTTP request with local cache update.
+
         Returns:
-            Current price in USD, or None if unavailable
+            Current price in USD, or None if unavailable.
         """
-        # Check cache first
+        # 1. Try WebSocket feed first (sub-second updates, no rate limits)
+        if self.price_feed is not None:
+            age = self.price_feed.get_price_age_seconds(asset)
+            if age < self.price_cache_ttl:
+                ws_price = (
+                    self.price_feed.get_btc_price()
+                    if asset == "BTC"
+                    else self.price_feed.get_eth_price()
+                )
+                if ws_price is not None:
+                    logger.debug(
+                        "Using WebSocket price for %s: $%.2f (age=%.1fs)",
+                        asset, ws_price, age,
+                    )
+                    return ws_price
+
+        # 2. Check HTTP cache
         if asset in self.price_cache:
             price, timestamp = self.price_cache[asset]
             if time.time() - timestamp < self.price_cache_ttl:
                 return price
-        
-        # Map asset to CoinGecko ID
+
+        # 3. Fall back to CoinGecko HTTP
         asset_map = {
             'BTC': 'bitcoin',
-            'ETH': 'ethereum'
+            'ETH': 'ethereum',
         }
-        
         coin_id = asset_map.get(asset)
         if not coin_id:
             logger.warning("Unknown asset: %s", asset)
             return None
-        
+
         try:
-            url = f"https://api.coingecko.com/api/v3/simple/price"
+            url = "https://api.coingecko.com/api/v3/simple/price"
             params = {
                 'ids': coin_id,
-                'vs_currencies': 'usd'
+                'vs_currencies': 'usd',
             }
-            
             response = requests.get(url, params=params, timeout=5)
             response.raise_for_status()
-            
+
             data = response.json()
             price = data.get(coin_id, {}).get('usd')
-            
+
             if price:
                 self.price_cache[asset] = (price, time.time())
-                logger.debug("Fetched %s price: $%.2f", asset, price)
+                logger.debug("Fetched %s price via HTTP: $%.2f", asset, price)
                 return price
             else:
                 logger.warning("Price not found in CoinGecko response for %s", asset)
                 return None
-                
+
         except Exception as e:
             logger.error("Error fetching price for %s: %s", asset, e)
             return None
