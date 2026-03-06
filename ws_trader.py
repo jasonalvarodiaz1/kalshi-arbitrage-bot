@@ -1181,20 +1181,15 @@ class WSConvergenceTrader:
             p_yes_for_no = min(p_yes_for_no * 1.5, 0.25)
         model_prob_no = 1.0 - p_yes_for_no
 
-        # SKIP ATM and near-ATM brackets for NO too — model is unreliable there
-        is_atm_no = False
-        if floor_s is not None and cap_s is not None:
-            bracket_width = cap_s - floor_s
-            # Skip only if price is inside the bracket or immediately adjacent (1x width buffer)
-            dist_to_bracket = min(abs(current_price - floor_s), abs(current_price - cap_s))
-            if current_price >= floor_s and current_price < cap_s:
-                dist_to_bracket = 0  # price is IN the bracket
-            if dist_to_bracket < bracket_width * 1.0:
-                is_atm_no = True  # ATM buffer (1x bracket width) — model unreliable in/adjacent to current bracket
+        # ATM handling for NO side — graduated approach:
+        #   - Price IS inside bracket: allow only with overwhelming edge (15%+)
+        #   - Adjacent brackets: trade normally (tiered edge requirements protect us)
+        #   - The old 1x-width buffer was blocking ALL liquid brackets during ranging markets
+        price_in_bracket = (floor_s is not None and cap_s is not None
+                            and floor_s <= current_price < cap_s)
+        in_bracket_edge_min = 15.0  # must have 15%+ edge to trade the bracket containing the price
 
-        if is_atm_no:
-            pass  # Skip ATM/near-ATM NO trades entirely
-        elif no_ask > 70 and mins_left < 15:
+        if no_ask > 70 and mins_left < 15:
             pass  # Skip expensive NO (<15 min left) — log-normal underestimates fat-tail moves at short horizons
         elif no_ask >= self.min_price_cents and no_ask <= self.max_no_price_cents and no_depth >= self.min_book_depth:
             implied_prob_no = no_ask / 100.0
@@ -1212,6 +1207,10 @@ class WSConvergenceTrader:
                 min_edge = max(min_edge, 8.0)                  # near-ATM: need 8%+ edge
             else:
                 min_edge = max(min_edge, 10.0)                 # expensive NO (60c+): need 10%+ edge
+
+            # In-bracket override: if price IS inside this bracket, demand 15%+ edge
+            if price_in_bracket:
+                min_edge = max(min_edge, in_bracket_edge_min)
             # Short-expiry premium: within 20 min, demand +3% more edge (models are noisier near expiry)
             if mins_left < 20:
                 min_edge += 3.0
@@ -2257,21 +2256,14 @@ class WSConvergenceTrader:
                             if mins_s < 20:
                                 me += 3.0
 
-                            # ATM buffer check (mirrors evaluate_opportunity)
-                            is_atm_s = False
-                            if fs is not None and cs is not None:
-                                bw = cs - fs
-                                dist_s = min(abs(price_s - fs), abs(price_s - cs))
-                                if price_s >= fs and price_s < cs:
-                                    dist_s = 0
-                                if dist_s < bw * 1.0:
-                                    is_atm_s = True
+                            # ATM check (mirrors evaluate_opportunity)
+                            price_in_brk = (fs is not None and cs is not None
+                                            and fs <= price_s < cs)
+                            if price_in_brk:
+                                me = max(me, 15.0)  # in-bracket: 15%+ edge required
 
                             # Determine rejection reason
-                            if is_atm_s:
-                                reason = 'ATM'
-                                reject_counts['atm'] += 1
-                            elif no_ask_s > 70 and mins_s < 15:
+                            if no_ask_s > 70 and mins_s < 15:
                                 reason = 'SHORT+EXP'
                                 reject_counts['short_exp'] += 1
                             elif no_ask_s > self.max_no_price_cents:
@@ -2290,12 +2282,14 @@ class WSConvergenceTrader:
                             if mp_no >= self.min_confidence:
                                 no_pass_conf += 1
 
+                            brk_tag = ' IN_BRK' if price_in_brk else ''
+
                             if edge_s > best_edge:
                                 best_edge = edge_s
-                                best_tk_line = f"  BEST  {sample_tk}: no={no_ask_s}c d={no_depth_s} mp_no={mp_no*100:.0f}% edge={edge_s:.1f}% me={me:.0f}% mins={mins_s:.0f} [{reason}]"
+                                best_tk_line = f"  BEST  {sample_tk}: no={no_ask_s}c d={no_depth_s} mp_no={mp_no*100:.0f}% edge={edge_s:.1f}% me={me:.0f}% mins={mins_s:.0f} [{reason}{brk_tag}]"
 
                             if len(sample_lines) < 4:
-                                sample_lines.append(f"  DEBUG {sample_tk}: no={no_ask_s}c mp_no={mp_no*100:.0f}% edge={edge_s:.1f}% me={me:.0f}% mins={mins_s:.0f} [{reason}]")
+                                sample_lines.append(f"  DEBUG {sample_tk}: no={no_ask_s}c mp_no={mp_no*100:.0f}% edge={edge_s:.1f}% me={me:.0f}% mins={mins_s:.0f} [{reason}{brk_tag}]")
 
                         for line in sample_lines:
                             logger.info(line)
