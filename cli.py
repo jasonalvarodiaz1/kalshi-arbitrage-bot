@@ -250,6 +250,7 @@ def main():
     elif choice == "9":
         # Scan crypto markets for probability edge
         from probability_trader import ProbabilityTrader
+        from ws_price_feed import CryptoPriceFeed
         
         print("\n" + "="*60)
         print("📊 SCANNING CRYPTO MARKETS FOR PROBABILITY EDGE")
@@ -259,8 +260,17 @@ def main():
         print(f"ETH vol estimate: {Config.ETH_15MIN_VOL*100:.2f}%")
         print("="*60 + "\n")
         
-        prob_trader = ProbabilityTrader(api, Config)
-        opportunities = prob_trader.scan_crypto_markets()
+        feed = None
+        if Config.WS_PRICE_FEED_ENABLED:
+            feed = CryptoPriceFeed(max_reconnect_delay=Config.WS_RECONNECT_MAX_DELAY)
+            logger.info("WebSocket price feed started")
+        
+        try:
+            prob_trader = ProbabilityTrader(api, Config, price_feed=feed)
+            opportunities = prob_trader.scan_crypto_markets()
+        finally:
+            if feed is not None:
+                feed.stop()
         
         if opportunities:
             print(f"\n✅ Found {len(opportunities)} probability opportunities:\n")
@@ -278,6 +288,7 @@ def main():
         # Continuous auto-trading for probability strategy
         from probability_trader import ProbabilityTrader
         from kelly import size_position
+        from ws_price_feed import CryptoPriceFeed
         
         print("\n" + "="*60)
         print("🤖 CONTINUOUS PROBABILITY AUTO-TRADING")
@@ -290,6 +301,12 @@ def main():
         print(f"Press Ctrl+C to stop")
         print("="*60 + "\n")
         
+        # Initialize WebSocket price feed if enabled
+        feed = None
+        if Config.WS_PRICE_FEED_ENABLED:
+            feed = CryptoPriceFeed(max_reconnect_delay=Config.WS_RECONNECT_MAX_DELAY)
+            logger.info("WebSocket price feed started")
+        
         # Initialize trader
         starting_balance = api.get_balance() if Config.LIVE_TRADING_ENABLED else 250.0
         trader = KalshiTradingBot(
@@ -299,7 +316,7 @@ def main():
             storage=storage
         )
         
-        prob_trader = ProbabilityTrader(api, Config)
+        prob_trader = ProbabilityTrader(api, Config, price_feed=feed)
         
         iteration = 0
         try:
@@ -420,6 +437,9 @@ def main():
             print(f"Total trades: {len(trader.trade_history)}")
             print(f"{'='*60}")
             logger.info("Probability session ended: %d scans, %d trades", iteration, len(trader.trade_history))
+            if feed is not None:
+                feed.stop()
+                logger.info("WebSocket price feed stopped")
             if storage:
                 storage.close()
                 logger.info("Storage flushed and closed.")
