@@ -1,4 +1,4 @@
-"""Real-time BTC/ETH price feed via Binance public WebSocket streams."""
+"""Real-time BTC/ETH price feed via Coinbase Exchange public WebSocket."""
 
 import json
 import logging
@@ -10,25 +10,27 @@ import websocket
 
 logger = logging.getLogger('kalshi_bot')
 
-_BINANCE_STREAM_URL = (
-    "wss://stream.binance.com:9443/stream"
-    "?streams=btcusdt@ticker/ethusdt@ticker"
-)
+_COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
 
-_SYMBOL_MAP = {
-    "btcusdt": "BTC",
-    "ethusdt": "ETH",
+_SUBSCRIBE_MSG = json.dumps({
+    "type": "subscribe",
+    "product_ids": ["BTC-USD", "ETH-USD"],
+    "channels": ["ticker"],
+})
+
+_PRODUCT_MAP = {
+    "BTC-USD": "BTC",
+    "ETH-USD": "ETH",
 }
 
 
 class CryptoPriceFeed:
     """
-    Real-time BTC and ETH price feed via the Binance public WebSocket API.
+    Real-time BTC and ETH price feed via the Coinbase Exchange public WebSocket.
 
-    No API key is required.  Prices are updated sub-second as Binance pushes
-    24 h rolling-ticker events.  The feed runs in a background daemon thread
-    and reconnects automatically (exponential back-off, capped at
-    ``max_reconnect_delay`` seconds).
+    No API key is required.  Prices are updated sub-second as Coinbase pushes
+    ticker events.  The feed runs in a background daemon thread and reconnects
+    automatically (exponential back-off, capped at ``max_reconnect_delay`` s).
     """
 
     def __init__(self, max_reconnect_delay: int = 30) -> None:
@@ -42,7 +44,7 @@ class CryptoPriceFeed:
 
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
-        logger.debug("CryptoPriceFeed started (Binance combined stream)")
+        logger.debug("CryptoPriceFeed started (Coinbase Exchange WebSocket)")
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -106,7 +108,7 @@ class CryptoPriceFeed:
 
     def _connect(self) -> None:
         self._ws = websocket.WebSocketApp(
-            _BINANCE_STREAM_URL,
+            _COINBASE_WS_URL,
             on_open=self._on_open,
             on_message=self._on_message,
             on_error=self._on_error,
@@ -116,19 +118,19 @@ class CryptoPriceFeed:
 
     def _on_open(self, websocket_app) -> None:  # noqa: ARG002
         self._connected = True
+        websocket_app.send(_SUBSCRIBE_MSG)
         logger.debug("CryptoPriceFeed WebSocket connected")
 
     def _on_message(self, websocket_app, raw: str) -> None:  # noqa: ARG002
         try:
-            envelope = json.loads(raw)
-            # Combined stream format: {"stream": "btcusdt@ticker", "data": {...}}
-            stream = envelope.get("stream", "")
-            data = envelope.get("data", {})
-            symbol_key = stream.split("@")[0]  # e.g. "btcusdt"
-            asset = _SYMBOL_MAP.get(symbol_key)
+            data = json.loads(raw)
+            if data.get("type") != "ticker":
+                return
+            product_id = data.get("product_id", "")
+            asset = _PRODUCT_MAP.get(product_id)
             if asset is None:
                 return
-            price_str = data.get("c")  # "c" = last price in Binance ticker
+            price_str = data.get("price")
             if price_str is None:
                 return
             price = float(price_str)

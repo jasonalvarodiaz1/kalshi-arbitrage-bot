@@ -40,6 +40,7 @@ except ImportError:
     SCIPY_AVAILABLE = False
 
 from config import Config
+from ws_price_feed import CryptoPriceFeed
 
 logger = logging.getLogger('kalshi_bot')
 
@@ -65,7 +66,14 @@ class WSConvergenceTrader:
 
         # Price feed
         self.price_cache: Dict[str, Tuple[float, float]] = {}  # {asset: (price, ts)}
-        self.price_cache_ttl = 10  # seconds
+        self.price_cache_ttl = getattr(self.config, 'PRICE_CACHE_SECONDS', 10)
+
+        # Real-time Binance WebSocket feed for BTC/ETH (sub-second latency)
+        self._ws_price_feed: Optional[CryptoPriceFeed] = None
+        if getattr(self.config, 'WS_PRICE_FEED_ENABLED', True):
+            max_delay = getattr(self.config, 'WS_RECONNECT_MAX_DELAY', 30)
+            self._ws_price_feed = CryptoPriceFeed(max_reconnect_delay=max_delay)
+            logger.info("CryptoPriceFeed started (Binance WebSocket, BTC+ETH)")
 
         # Orderbook state (from WebSocket)
         self.orderbooks: Dict[str, Dict] = {}  # {market_ticker: {yes: [[price,qty]], no: [[price,qty]]}}
@@ -262,10 +270,26 @@ class WSConvergenceTrader:
     # ─── Price feed ───────────────────────────────────────────────────────
 
     def get_price(self, asset: str) -> Optional[float]:
+        # 1. Try Binance WebSocket feed (BTC/ETH only — sub-second, no rate limits)
+        if self._ws_price_feed is not None and asset in ('BTC', 'ETH'):
+            age = self._ws_price_feed.get_price_age_seconds(asset)
+            if age < self.price_cache_ttl:
+                ws_price = (
+                    self._ws_price_feed.get_btc_price()
+                    if asset == 'BTC'
+                    else self._ws_price_feed.get_eth_price()
+                )
+                if ws_price is not None:
+                    logger.debug("WS price %s: $%.2f (age=%.1fs)", asset, ws_price, age)
+                    return ws_price
+
+        # 2. HTTP cache
         if asset in self.price_cache:
             price, ts = self.price_cache[asset]
             if time.time() - ts < self.price_cache_ttl:
                 return price
+
+        # 3. HTTP fetch (CoinGecko → CryptoCompare)
         return self._fetch_prices().get(asset)
 
     _ASSETS = ['BTC', 'ETH', 'DOGE', 'XRP', 'SOL']
@@ -2381,6 +2405,9 @@ class WSConvergenceTrader:
         self._running = False
         if self.ws:
             asyncio.ensure_future(self.ws.close())
+        if self._ws_price_feed is not None:
+            self._ws_price_feed.stop()
+            self._ws_price_feed = None
 
 
 def main():
