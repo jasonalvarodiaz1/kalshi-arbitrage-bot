@@ -1183,11 +1183,19 @@ class WSConvergenceTrader:
 
         # ATM handling for NO side — graduated approach:
         #   - Price IS inside bracket: allow only with overwhelming edge (15%+)
+        #   - Price within 0.5% of boundary: near-boundary penalty (+5% edge, treated as in-bracket if <0.2%)
         #   - Adjacent brackets: trade normally (tiered edge requirements protect us)
-        #   - The old 1x-width buffer was blocking ALL liquid brackets during ranging markets
         price_in_bracket = (floor_s is not None and cap_s is not None
                             and floor_s <= current_price < cap_s)
-        in_bracket_edge_min = 15.0  # must have 15%+ edge to trade the bracket containing the price
+        near_boundary = False
+        very_near_boundary = False
+        if floor_s is not None and cap_s is not None and current_price > 0:
+            # Distance to nearest bracket edge as % of current price
+            dist_to_floor = abs(current_price - floor_s) / current_price
+            dist_to_cap   = abs(current_price - cap_s)   / current_price
+            nearest_boundary_pct = min(dist_to_floor, dist_to_cap)
+            near_boundary       = nearest_boundary_pct < 0.005  # within 0.5%
+            very_near_boundary  = nearest_boundary_pct < 0.002  # within 0.2% — treat same as in-bracket
 
         if no_ask > 70 and mins_left < 15:
             pass  # Skip expensive NO (<15 min left) — log-normal underestimates fat-tail moves at short horizons
@@ -1208,15 +1216,20 @@ class WSConvergenceTrader:
             else:
                 min_edge = max(min_edge, 10.0)                 # expensive NO (60c+): need 10%+ edge
 
-            # In-bracket override: if price IS inside this bracket, demand 15%+ edge
-            if price_in_bracket:
-                min_edge = max(min_edge, in_bracket_edge_min)
+            # In-bracket / near-boundary overrides
+            if price_in_bracket or very_near_boundary:
+                min_edge = max(min_edge, 15.0)  # within 0.2% of boundary: treat as in-bracket
+            elif near_boundary:
+                min_edge = max(min_edge, min_edge + 5.0)  # within 0.5%: +5% edge premium
+
             # Short-expiry premium: within 20 min, demand +3% more edge (models are noisier near expiry)
             if mins_left < 20:
                 min_edge += 3.0
 
-            # Also require high model confidence for NO bets
-            min_conf_no = 0.60  # must be 60%+ confident in NO
+            # Model confidence requirements
+            min_conf_no = 0.60  # baseline: 60%+ model confidence
+            if no_ask >= 75:
+                min_conf_no = 0.90  # expensive NO: model must be 90%+ confident
 
             if edge_no >= min_edge and model_prob_no >= min_conf_no:
                 return {
@@ -2256,11 +2269,21 @@ class WSConvergenceTrader:
                             if mins_s < 20:
                                 me += 3.0
 
-                            # ATM check (mirrors evaluate_opportunity)
+                            # ATM / near-boundary check (mirrors evaluate_opportunity)
                             price_in_brk = (fs is not None and cs is not None
                                             and fs <= price_s < cs)
-                            if price_in_brk:
-                                me = max(me, 15.0)  # in-bracket: 15%+ edge required
+                            near_boundary_s = False
+                            very_near_boundary_s = False
+                            if fs is not None and cs is not None and price_s > 0:
+                                dist_f = abs(price_s - fs) / price_s
+                                dist_c = abs(price_s - cs) / price_s
+                                nb_pct = min(dist_f, dist_c)
+                                near_boundary_s = nb_pct < 0.005
+                                very_near_boundary_s = nb_pct < 0.002
+                            if price_in_brk or very_near_boundary_s:
+                                me = max(me, 15.0)  # in-bracket or within 0.2%: 15%+ edge
+                            elif near_boundary_s:
+                                me = max(me, me + 5.0)  # within 0.5%: +5% premium
 
                             # Determine rejection reason
                             if no_ask_s > 70 and mins_s < 15:
@@ -2282,7 +2305,14 @@ class WSConvergenceTrader:
                             if mp_no >= self.min_confidence:
                                 no_pass_conf += 1
 
-                            brk_tag = ' IN_BRK' if price_in_brk else ''
+                            if price_in_brk:
+                                brk_tag = ' IN_BRK'
+                            elif very_near_boundary_s:
+                                brk_tag = ' VERY_NEAR_BND'
+                            elif near_boundary_s:
+                                brk_tag = ' NEAR_BND'
+                            else:
+                                brk_tag = ''
 
                             if edge_s > best_edge:
                                 best_edge = edge_s
@@ -2307,22 +2337,27 @@ class WSConvergenceTrader:
                     # Refresh balance
                     try:
                         balance = self.api.get_balance()
-                        # ── Rule 4: Stop-loss check ──
-                        # Use effective_balance = balance + total_exposure so that
-                        # capital deployed into open live positions is NOT counted as
-                        # a loss (Kalshi debits premium immediately on fill).
-                        effective_balance = balance + self.total_exposure
-                        drawdown = (self.starting_balance - effective_balance) / self.starting_balance
-                        if drawdown >= self.stop_loss_pct:
-                            if not self.stop_loss_triggered:
-                                logger.warning("STOP-LOSS TRIGGERED: balance=$%.2f, effective=$%.2f, drawdown=%.1f%% >= %.0f%% threshold. Halting trades.",
-                                               balance, effective_balance, drawdown * 100, self.stop_loss_pct * 100)
-                            self.stop_loss_triggered = True
+                        # Guard: a zero/near-zero balance is a bad API read (happens at startup
+                        # before auth completes or during reconnect). Never let a transient
+                        # zero-balance fire the stop-loss — it would halt the bot on a ghost.
+                        if balance is None or balance < 1.0:
+                            logger.debug("Balance read returned $%.2f — skipping stop-loss check (likely transient)", balance or 0)
                         else:
-                            if self.stop_loss_triggered:
-                                logger.info("STOP-LOSS CLEARED: effective_balance=$%.2f, drawdown=%.1f%% — resuming trades.",
-                                            effective_balance, drawdown * 100)
-                            self.stop_loss_triggered = False
+                            # ── Rule 4: Stop-loss check ──
+                            # effective_balance = cash + open-position cost (Kalshi debits premium
+                            # immediately, so exposure must be added back to get true equity).
+                            effective_balance = balance + self.total_exposure
+                            drawdown = (self.starting_balance - effective_balance) / self.starting_balance
+                            if drawdown >= self.stop_loss_pct:
+                                if not self.stop_loss_triggered:
+                                    logger.warning("STOP-LOSS TRIGGERED: balance=$%.2f, effective=$%.2f, drawdown=%.1f%% >= %.0f%% threshold. Halting trades.",
+                                                   balance, effective_balance, drawdown * 100, self.stop_loss_pct * 100)
+                                self.stop_loss_triggered = True
+                            else:
+                                if self.stop_loss_triggered:
+                                    logger.info("STOP-LOSS CLEARED: effective_balance=$%.2f, drawdown=%.1f%% — resuming trades.",
+                                                effective_balance, drawdown * 100)
+                                self.stop_loss_triggered = False
                     except Exception:
                         pass
 
