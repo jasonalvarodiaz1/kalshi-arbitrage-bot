@@ -270,15 +270,16 @@ class WSConvergenceTrader:
     # ─── Price feed ───────────────────────────────────────────────────────
 
     def get_price(self, asset: str) -> Optional[float]:
-        # 1. Try Binance WebSocket feed (BTC/ETH only — sub-second, no rate limits)
-        if self._ws_price_feed is not None and asset in ('BTC', 'ETH'):
+        # 1. Try Coinbase WebSocket feed (BTC/ETH/SOL — sub-second, no rate limits)
+        if self._ws_price_feed is not None and asset in ('BTC', 'ETH', 'SOL'):
             age = self._ws_price_feed.get_price_age_seconds(asset)
             if age < self.price_cache_ttl:
-                ws_price = (
-                    self._ws_price_feed.get_btc_price()
-                    if asset == 'BTC'
-                    else self._ws_price_feed.get_eth_price()
-                )
+                if asset == 'BTC':
+                    ws_price = self._ws_price_feed.get_btc_price()
+                elif asset == 'ETH':
+                    ws_price = self._ws_price_feed.get_eth_price()
+                else:
+                    ws_price = self._ws_price_feed.get_sol_price()
                 if ws_price is not None:
                     logger.debug("WS price %s: $%.2f (age=%.1fs)", asset, ws_price, age)
                     return ws_price
@@ -604,13 +605,14 @@ class WSConvergenceTrader:
                 eth = self.api.get_all_markets(status="open", series_ticker="KXETH")
                 doge = self.api.get_all_markets(status="open", series_ticker="KXDOGE")
                 xrp = self.api.get_all_markets(status="open", series_ticker="KXXRP")
+                sol = self.api.get_all_markets(status="open", series_ticker="KXSOL")
             except Exception as e:
                 logger.error("REST scan failed: %s", e)
                 return []
         else:
-            btc = eth = doge = xrp = []
+            btc = eth = doge = xrp = sol = []
 
-        all_markets = btc + eth + doge + xrp
+        all_markets = btc + eth + doge + xrp + sol
 
         # Also fetch 15-minute binary up/down markets
         disable_binary = getattr(self.config, 'DISABLE_BINARY_15M', True)

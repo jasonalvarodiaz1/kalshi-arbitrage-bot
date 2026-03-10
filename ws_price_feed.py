@@ -1,4 +1,4 @@
-"""Real-time BTC/ETH price feed via Coinbase Exchange public WebSocket."""
+"""Real-time BTC/ETH/SOL price feed via Coinbase Exchange public WebSocket."""
 
 import json
 import logging
@@ -14,13 +14,14 @@ _COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
 
 _SUBSCRIBE_MSG = json.dumps({
     "type": "subscribe",
-    "product_ids": ["BTC-USD", "ETH-USD"],
+    "product_ids": ["BTC-USD", "ETH-USD", "SOL-USD"],
     "channels": ["ticker"],
 })
 
 _PRODUCT_MAP = {
     "BTC-USD": "BTC",
     "ETH-USD": "ETH",
+    "SOL-USD": "SOL",
 }
 
 
@@ -57,6 +58,11 @@ class CryptoPriceFeed:
         """Return the latest ETH/USD price, or None if not yet received."""
         with self._lock:
             return self._prices.get("ETH")
+
+    def get_sol_price(self) -> Optional[float]:
+        """Return the latest SOL/USD price, or None if not yet received."""
+        with self._lock:
+            return self._prices.get("SOL")
 
     def get_price_age_seconds(self, symbol: str) -> float:
         """
