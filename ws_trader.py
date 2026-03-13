@@ -1135,8 +1135,10 @@ class WSConvergenceTrader:
                 if p == yes_bid:
                     no_depth = q
                     break
-            # NO DEPTH FALLBACK: if orderbook has no real depth, depth stays 0
-            # Previously we faked depth=min_book_depth which caused phantom fills
+            # Ticker fallback: if YES orderbook empty but ticker has valid yes_bid,
+            # use depth=1. Slippage guard caps qty to 1 contract, eliminating phantom-fill risk.
+            if no_depth == 0 and not yes_bids:
+                no_depth = 1  # ticker-fallback: book not yet populated / no standing limit orders
 
         # YES depth from NO bids at matching level
         yes_depth = 0
@@ -1201,7 +1203,7 @@ class WSConvergenceTrader:
 
         if no_ask > 70 and mins_left < 15:
             pass  # Skip expensive NO (<15 min left) — log-normal underestimates fat-tail moves at short horizons
-        elif no_ask >= self.min_price_cents and no_ask <= self.max_no_price_cents and no_depth >= self.min_book_depth:
+        elif no_ask >= self.min_price_cents and no_ask <= self.max_no_price_cents and no_depth >= 1:
             implied_prob_no = no_ask / 100.0
             edge_no = (model_prob_no - implied_prob_no) * 100
             min_edge = self.min_edge_pct
@@ -2212,6 +2214,11 @@ class WSConvergenceTrader:
 
                     # Debug: sample tickers and show exactly which filter blocks each one
                     if opps_found == 0 and self.market_meta:
+                        # Diagnostic: count how many tickers have usable yes_bid
+                        _td_nonzero = sum(1 for v in self.ticker_data.values() if v.get('yes_bid', 0) > 0)
+                        _ob_nonzero = sum(1 for v in self.orderbooks.values() if v.get('yes', []))
+                        logger.info("  DIAG: ticker_data=%d entries (%d w/yes_bid>0) | orderbooks=%d entries (%d w/yes_bids)",
+                                    len(self.ticker_data), _td_nonzero, len(self.orderbooks), _ob_nonzero)
                         no_liq_count = 0
                         no_pass_edge = 0
                         no_pass_conf = 0
@@ -2240,7 +2247,10 @@ class WSConvergenceTrader:
                                 for p, q in yes_bids_s:
                                     if p == yb_s:
                                         no_depth_s = q
-                            if no_ask_s < 4 or no_depth_s < self.min_book_depth:
+                            # Ticker fallback: same as evaluate_opportunity
+                            if no_depth_s == 0 and not yes_bids_s and no_ask_s:
+                                no_depth_s = 1
+                            if no_ask_s < 4 or no_depth_s < 1:
                                 if no_ask_s >= 4:
                                     reject_counts['depth'] += 1
                                 continue
